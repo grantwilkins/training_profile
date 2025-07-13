@@ -40,7 +40,6 @@ import argparse
 import os
 from typing import Dict, List
 
-import torch
 from datasets import load_dataset
 from transformers import (
     DataCollatorForLanguageModeling,
@@ -134,13 +133,21 @@ def get_dataset(
 
 
 def main():
+    import torch.distributed
+
     args = parse_args()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    # Initialize distributed process group if needed
+    if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
     torch.cuda.set_device(local_rank)
+
     tokenizer = LlamaTokenizerFast.from_pretrained(args.model_name)
     tokenizer.pad_token = tokenizer.eos_token  # ensure a pad token is defined
-    dataset = get_dataset(
-        args.dataset_path, tokenizer, args.sequence_length, args.text_column
+    dataset = load_dataset(
+        "allenai/c4", data_files="en/c4-train.0000*-of-01024.json.gz"
     )
 
     data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
