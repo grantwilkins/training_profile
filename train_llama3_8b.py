@@ -40,6 +40,7 @@ import argparse
 import os
 from typing import Dict, List
 
+import torch
 from datasets import load_dataset
 from transformers import (
     DataCollatorForLanguageModeling,
@@ -105,15 +106,27 @@ def get_dataset(
     text_column: str = None,
 ):
     """Load and tokenize dataset into fixed‑length blocks suitable for language modelling."""
-    ds = load_dataset(dataset_path, split="train")
+    # Handle c4 dataset with specific data files
+    if dataset_path == "allenai/c4":
+        ds = load_dataset(
+            "allenai/c4", data_files="en/c4-train.0000*-of-01024.json.gz", split="train"
+        )
+    else:
+        ds = load_dataset(dataset_path, split="train")
+
     column = text_column or (
         "text" if "text" in ds.column_names else ds.column_names[0]
     )
 
     def tokenize_fn(batch: Dict[str, List[str]]):
-        return tokenizer(batch[column])
+        return tokenizer(batch[column], truncation=True, padding=False)
 
-    tokenized = ds.map(tokenize_fn, batched=True, num_proc=os.cpu_count())
+    tokenized = ds.map(
+        tokenize_fn,
+        batched=True,
+        num_proc=os.cpu_count(),
+        remove_columns=ds.column_names,
+    )
 
     # Group into blocks of seq_len tokens
     def group_fn(examples):
@@ -125,7 +138,10 @@ def get_dataset(
         result = {
             "input_ids": [
                 concatenated[i : i + seq_len] for i in range(0, total_length, seq_len)
-            ]
+            ],
+            "labels": [
+                concatenated[i : i + seq_len] for i in range(0, total_length, seq_len)
+            ],
         }
         return result
 
@@ -146,9 +162,21 @@ def main():
 
     tokenizer = LlamaTokenizerFast.from_pretrained(args.model_name)
     tokenizer.pad_token = tokenizer.eos_token  # ensure a pad token is defined
-    dataset = load_dataset(
-        "allenai/c4", data_files="en/c4-train.0000*-of-01024.json.gz"
+
+    # Load and prepare dataset using the get_dataset function
+    dataset = get_dataset(
+        args.dataset_path, tokenizer, args.sequence_length, args.text_column
     )
+
+    # Print dataset info for debugging
+    if local_rank == 0:
+        print(f"Dataset type: {type(dataset)}")
+        print(f"Dataset length: {len(dataset)}")
+        print(f"Dataset columns: {dataset.column_names}")
+        if len(dataset) > 0:
+            print(f"First sample keys: {list(dataset[0].keys())}")
+            print(f"Sample input_ids length: {len(dataset[0]['input_ids'])}")
+            print(f"Sample labels length: {len(dataset[0]['labels'])}")
 
     data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
     model = LlamaForCausalLM.from_pretrained(args.model_name)
@@ -186,7 +214,7 @@ def main():
         model=model,
         args=training_args,
         train_dataset=dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=data_collator,
     )
 
