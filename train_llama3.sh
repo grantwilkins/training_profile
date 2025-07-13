@@ -1,7 +1,12 @@
 DATE_TIME=$(date '+%Y-%m-%d-%H-%M-%S')
 nvidia-smi --query-gpu=timestamp,power.draw,utilization.gpu,memory.used --format=csv -lms 250 >> llama-3-8b_${DATE_TIME}.csv &
 NVIDIA_SMI_PID=$!
-torchrun --nproc_per_node 2 train_llama3_8b.py --model_name meta-llama/Llama-3.1-8B-Instruct --dataset_path allenai/c4 --sequence_length 2048 --micro_batch_size 4 --global_batch_size 64 --bf16 --output_dir ./ --train_steps 2000 &
+
+# Set memory optimization environment variables
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export TOKENIZERS_PARALLELISM=false
+
+torchrun --nproc_per_node 2 train_llama3_8b.py --model_name meta-llama/Llama-3.1-8B-Instruct --dataset_path allenai/c4 --sequence_length 1024 --micro_batch_size 1 --global_batch_size 16 --bf16 --output_dir ./ --train_steps 2000 &
 TRAINING_PID=$!
 
 sleep 120 # Allow training to run for 2 minutes before interrupting it
