@@ -119,7 +119,9 @@ def get_dataset(
     )
 
     def tokenize_fn(batch: Dict[str, List[str]]):
-        return tokenizer(batch[column], truncation=True, padding=False)
+        return tokenizer(
+            batch[column], truncation=True, padding=False, return_attention_mask=False
+        )
 
     tokenized = ds.map(
         tokenize_fn,
