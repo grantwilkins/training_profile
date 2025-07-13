@@ -96,6 +96,11 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
 
+    # Add local_rank argument for backward compatibility with torch.distributed.launch
+    parser.add_argument(
+        "--local_rank", type=int, default=0, help="Local rank for distributed training"
+    )
+
     return parser.parse_args()
 
 
@@ -154,7 +159,8 @@ def main():
     import torch.distributed
 
     args = parse_args()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    # Use local_rank from command line argument or environment variable
+    local_rank = args.local_rank or int(os.environ.get("LOCAL_RANK", 0))
 
     # Initialize distributed process group if needed
     if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
