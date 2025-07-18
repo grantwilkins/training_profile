@@ -187,7 +187,7 @@ def main():
             print(f"Sample labels length: {len(dataset[0]['labels'])}")
 
     data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
-    model = LlamaForCausalLM.from_pretrained(args.model_name)
+    model = LlamaForCausalLM.from_pretrained(args.model_name, device_map="none")
     model.gradient_checkpointing_enable()
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     grad_accum = args.global_batch_size // (args.micro_batch_size * world_size)
