@@ -18,6 +18,8 @@ Usage (unchanged):
 import argparse
 import json
 import os
+
+os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION_IMPORTS", "1")
 import random
 import time
 import warnings
@@ -214,10 +216,13 @@ def build_model(cfg: ModelConfig, base: str, use_flash: bool):
     conf.max_position_embeddings = cfg.max_position_embeddings
 
     if use_flash and FLASH_ATTN_AVAILABLE:
-        conf.attn_implementation = "flash_attention_2"
+        # Use private attribute name in recent Transformers
+        setattr(conf, "_attn_implementation", "flash_attention_2")
     else:
-        conf.attn_implementation = (
-            "sdpa" if hasattr(F, "scaled_dot_product_attention") else "eager"
+        setattr(
+            conf,
+            "_attn_implementation",
+            "sdpa" if hasattr(F, "scaled_dot_product_attention") else "eager",
         )
 
     return AutoModelForCausalLM.from_config(conf)
@@ -245,14 +250,17 @@ def build_loader(tokenizer, seqlen: int, bs: int, workers: Optional[int]):
         out["labels"] = [ids[:] for ids in out["input_ids"]]
         return out
 
-    ds = ds.map(tok, batched=True, batch_size=1000, remove_columns=["text"])
+    # drop all original meta columns so only token fields remain
+    ds = ds.map(
+        tok, batched=True, batch_size=1000, remove_columns=list(ds.column_names)
+    )
 
     def collate(examples):
-        keys = examples[0].keys()
-        coll = {}
-        for k in keys:
-            coll[k] = torch.tensor([e[k] for e in examples], dtype=torch.long)
-        return coll
+        # keep only token fields; meta fields (e.g. timestamps) were removed above
+        keys = ("input_ids", "attention_mask", "labels")
+        return {
+            k: torch.tensor([e[k] for e in examples], dtype=torch.long) for k in keys
+        }
 
     return DataLoader(
         ds, batch_size=bs, collate_fn=collate, num_workers=0, pin_memory=True
