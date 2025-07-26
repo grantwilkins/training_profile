@@ -52,7 +52,7 @@ def plot_power_trace(df, output_file=None):
     plt.plot(df["datetime"], df["power_watts"])
     plt.ylabel("Server Power (W)", fontsize=12)
     plt.xlabel("Time", fontsize=12)
-    plt.ylim(0, 4500)
+    plt.ylim(0, 5000)
     plt.grid(True)
 
     # Format x-axis
@@ -70,7 +70,7 @@ def plot_power_trace(df, output_file=None):
 
 
 def main():
-    csv_file = "power-trace_2025-07-26-23-11-14.csv"
+    csv_file = "power-trace_2025-07-26-23-32-09.csv"
     output_file = "power_trace_plot.pdf"
 
     print(f"Processing power data from: {csv_file}")
