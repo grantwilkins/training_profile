@@ -250,10 +250,8 @@ def build_loader(tokenizer, seqlen: int, bs: int, workers: Optional[int]):
         out["labels"] = [ids[:] for ids in out["input_ids"]]
         return out
 
-    # drop all original meta columns so only token fields remain
-    ds = ds.map(
-        tok, batched=True, batch_size=1000, remove_columns=list(ds.column_names)
-    )
+    # For streaming datasets `column_names` can be `None`; just drop the raw text field.
+    ds = ds.map(tok, batched=True, batch_size=1000, remove_columns=["text"])
 
     def collate(examples):
         # keep only token fields; meta fields (e.g. timestamps) were removed above
@@ -290,8 +288,11 @@ def step_fn(model, batch, optim, sched, scaler, ga_steps, step, dtype, rank, tim
     with timing("fw", rank, timing_on):
         out = model(**batch)
         loss = out.loss / ga_steps
+
+    fp16_mode = dtype == torch.float16 and scaler is not None  # only valid combo
+
     with timing("bw", rank, timing_on):
-        if scaler:
+        if fp16_mode:
             scaler.scale(loss).backward()
         else:
             loss.backward()
@@ -299,7 +300,7 @@ def step_fn(model, batch, optim, sched, scaler, ga_steps, step, dtype, rank, tim
 
     if (step + 1) % ga_steps == 0:
         with timing("optim", rank, timing_on):
-            if scaler:
+            if fp16_mode:
                 scaler.unscale_(optim)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optim)
@@ -375,7 +376,8 @@ def main():
         model, args.learning_rate, args.weight_decay, args.use_fused_optimizer
     )
     sched = get_cosine_schedule_with_warmup(optim, args.warmup_steps, args.max_steps)
-    scaler = torch.cuda.amp.GradScaler() if amp else None
+    # GradScaler only supports fp16; for bf16 we disable scaling
+    scaler = torch.cuda.amp.GradScaler() if args.precision == "fp16" else None
 
     os.makedirs(args.output_dir, exist_ok=True)
 
