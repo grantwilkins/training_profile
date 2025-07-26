@@ -1,25 +1,22 @@
-#!/bin/bash
-# Power monitoring and fault injection script for train_gpt.py
-# Reproduces the same power transient scenarios as train_llama3.sh
+#!/usr/bin/env bash
+# train_gpt_power.sh — power monitoring & fault‑injection wrapper for train_gpt.py
+# Patched 2025‑07‑26
+
+set -euo pipefail
 
 DATE_TIME=$(date '+%Y-%m-%d-%H-%M-%S')
-nvidia-smi --query-gpu=timestamp,power.draw,utilization.gpu,memory.used --format=csv -lms 100 >> train-gpt-8b_${DATE_TIME}.csv &
-NVIDIA_SMI_PID=$!
+LOG=power-trace_${DATE_TIME}.csv
 
-# Set memory optimization environment variables
+# ----- launch nvidia‑smi sampler (100 ms) -----
+nvidia-smi --query-gpu=timestamp,power.draw,utilization.gpu,memory.used --format=csv -lms 100 >> "$LOG" &
+SMI_PID=$!
+echo "NVML logging to $LOG (pid=$SMI_PID)"
+
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
 
-# Start training with optimizations enabled
-# Equivalent parameters to original script:
-# - 8B model (instead of meta-llama/Llama-3.1-8B-Instruct)
-# - allenai/c4 dataset (built-in)
-# - sequence_length 1024
-# - batch_size 1 per GPU
-# - gradient_accumulation_steps 2 (1 * 8 * 2 = 16 global batch size)
-# - bf16 precision
-# - 2000 training steps
-torchrun --standalone --nproc_per_node 8 train_gpt.py \
+# ----- start training -----
+CMD=(torchrun --standalone --nproc_per_node 8 train_gpt.py \
     --model_size 8B \
     --sequence_length 1024 \
     --batch_size 1 \
@@ -32,28 +29,32 @@ torchrun --standalone --nproc_per_node 8 train_gpt.py \
     --log_steps 20 \
     --save_steps 500 \
     --monitor_memory \
-    --log_timing &
-TRAINING_PID=$!
+    --log_timing)
 
-sleep 300 # Allow training to run for 5 minutes before interrupting it
+"${CMD[@]}" &
+TRAIN_PID=$!
 
-# Simulate synchronization stall (SIGSTOP on rank 0)
-echo "Simulating synchronization stall - stopping rank 0..."
-pkill -STOP -f "LOCAL_RANK=0"
+# give the job 5 min to warm‑up
+sleep 300
+
+# ----- synchronisation stall (SIGSTOP rank 0) -----
+echo "Simulating sync‑stall (STOP rank 0)" >&2
+RANK0=$(ps -e -o pid,cmd | grep 'train_gpt.py' | grep -v grep | head -n1 | awk '{print $1}')
+kill -STOP "$RANK0"
 sleep 5
-echo "Resuming rank 0..."
-pkill -CONT -f "LOCAL_RANK=0"
+kill -CONT "$RANK0"
 
+echo "Resumed rank 0" >&2
 sleep 60
 
-# Simulate fail-stop crash (SIGKILL on rank 1)
-echo "Simulating fail-stop crash - killing rank 1..."
-pkill -9 -f "LOCAL_RANK=1"   # torchrun notices and aborts
+# ----- fail‑stop crash (SIGKILL rank 1) -----
+echo "Simulating fail‑stop (KILL rank 1)" >&2
+RANK1=$(ps -e -o pid,cmd | grep 'train_gpt.py' | grep -v grep | head -n2 | tail -n1 | awk '{print $1}')
+kill -9 "$RANK1"
 
-wait $TRAINING_PID || true
+# wait for torchrun to propagate failure
+wait "$TRAIN_PID" || true
 
-echo "Training finished, stopping power monitoring..."
-kill -9 ${NVIDIA_SMI_PID}
-
-echo "Power trace saved to: train-gpt-8b_${DATE_TIME}.csv"
-echo "Training logs and checkpoints saved to current directory" 
+echo "Training finished; stopping NVML logger" >&2
+kill -9 "$SMI_PID"
+echo "Power trace written to $LOG"
