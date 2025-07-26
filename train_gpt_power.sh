@@ -18,24 +18,24 @@ export TOKENIZERS_PARALLELISM=false
 # ----- start training -----
 CMD=(torchrun --standalone --nproc_per_node 8 train_gpt.py \
     --model_size 8B \
-    --sequence_length 1024 \
+    --sequence_length 2048 \
     --batch_size 1 \
     --gradient_accumulation_steps 2 \
     --precision bf16 \
-    --max_steps 2000 \
+    --max_steps 4000 \
     --use_flash_attn \
     --use_fused_optimizer \
     --output_dir ./ \
     --log_steps 20 \
-    --save_steps 500 \
+    --save_steps 200 \
     --monitor_memory \
     --log_timing)
 
 "${CMD[@]}" &
 TRAIN_PID=$!
 
-# give the job 5 min to warm‑up
-sleep 300
+# give the job 10 min to warm‑up
+sleep 600
 
 # ----- synchronisation stall (SIGSTOP rank 0) -----
 echo "Simulating sync‑stall (STOP rank 0)" >&2
@@ -54,6 +54,8 @@ kill -9 "$RANK1"
 
 # wait for torchrun to propagate failure
 wait "$TRAIN_PID" || true
+
+sleep 30
 
 echo "Training finished; stopping NVML logger" >&2
 kill -9 "$SMI_PID"
