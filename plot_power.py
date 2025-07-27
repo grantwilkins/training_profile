@@ -46,16 +46,14 @@ def parse_power_data(csv_file):
 def plot_power_trace(df, output_file=None):
     """Plot total power consumption"""
 
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(10, 4))
 
     # Plot total power consumption
-    plt.plot(df["datetime"], df["power_watts"], linewidth=1, color="red", alpha=0.8)
-    plt.ylabel("Total Power (W)", fontsize=12)
+    plt.plot(df["datetime"], df["power_watts"])
+    plt.ylabel("Server Power (W)", fontsize=12)
     plt.xlabel("Time", fontsize=12)
-    plt.title(
-        "GPU Power Consumption During Training (8×H100)", fontsize=14, fontweight="bold"
-    )
-    plt.grid(True, alpha=0.3)
+    plt.ylim(0, 5000)
+    plt.grid(True)
 
     # Format x-axis
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
@@ -72,8 +70,8 @@ def plot_power_trace(df, output_file=None):
 
 
 def main():
-    csv_file = "power-trace_2025-07-26-23-11-14.csv"
-    output_file = "power_trace_plot.png"
+    csv_file = "power-trace_2025-07-26-23-32-09.csv"
+    output_file = "power_trace_plot.pdf"
 
     print(f"Processing power data from: {csv_file}")
 
