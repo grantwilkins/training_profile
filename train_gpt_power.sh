@@ -25,9 +25,9 @@ CMD=(torchrun --standalone --nproc_per_node 8 train_gpt.py \
     --max_steps 4000 \
     --use_flash_attn \
     --use_fused_optimizer \
-    --output_dir ./ \
+    --output_dir /datadrive/ \
     --log_steps 20 \
-    --save_steps 200 \
+    --save_steps 1000 \
     --monitor_memory \
     --log_timing)
 

@@ -111,7 +111,7 @@ def parse_args():
     p.add_argument("--use_fused_optimizer", action="store_true", default=True)
 
     p.add_argument("--tokenizer_num_workers", type=int)
-    p.add_argument("--output_dir", default="./checkpoints")
+    p.add_argument("--output_dir", default="/datadrive")
     p.add_argument("--save_steps", type=int, default=1000)
     p.add_argument("--log_steps", type=int, default=10)
 
