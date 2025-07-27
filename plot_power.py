@@ -40,25 +40,27 @@ def parse_power_data(csv_file):
         .reset_index()
     )
 
+    # Convert to seconds from start (t=0)
+    start_time = aggregated["datetime"].iloc[0]
+    aggregated["time_seconds"] = (
+        aggregated["datetime"] - start_time
+    ).dt.total_seconds()
+
     return aggregated
 
 
 def plot_power_trace(df, output_file=None):
     """Plot total power consumption"""
 
-    plt.figure(figsize=(10, 4))
+    plt.figure(figsize=(5, 3))
 
     # Plot total power consumption
-    plt.plot(df["datetime"], df["power_watts"])
+    plt.plot(df["time_seconds"], df["power_watts"])
     plt.ylabel("Server Power (W)", fontsize=12)
-    plt.xlabel("Time", fontsize=12)
+    plt.xlabel("Time (s)", fontsize=12)
+    plt.xlim(0, df["time_seconds"].max())
     plt.ylim(0, 5000)
     plt.grid(True)
-
-    # Format x-axis
-    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
-    plt.gca().xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
-    plt.xticks(rotation=45)
 
     plt.tight_layout()
 
@@ -84,6 +86,8 @@ def main():
 
     # Create the plot
     plot_power_trace(df, output_file)
+    df.drop(columns=["group"], inplace=True)  # Clean up the DataFrame
+    df.to_csv("aggregated_power_data.csv", index=False)
 
 
 if __name__ == "__main__":
