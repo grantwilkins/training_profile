@@ -25,7 +25,7 @@ python3 train_gpt.py \
   --max_steps 4000 \
   --use_flash_attn \
   --use_fused_optimizer \
-  --output_dir /datadrive/ \
+  --output_dir /home/dennis/ \
   --log_steps 20 \
   --save_steps 1000 \
   --monitor_memory \
