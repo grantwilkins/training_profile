@@ -34,6 +34,30 @@ torchrun --nproc_per_node=8 train_gpt.py \
     --output_dir ./checkpoints/7b_bf16_optimized
 ```
 
+### Multi-Node: 2×12GB GPUs per node (Ray)
+
+```bash
+# On each node: start Ray (head on one node, worker on the other)
+# See RAY_SETUP.md for details
+
+# From the head node, launch training:
+python train_gpt.py \
+  --model_size 350M \
+  --sequence_length 1024 \
+  --batch_size 2 \
+  --gradient_accumulation_steps 4 \
+  --precision bf16 \
+  --num_workers 0 \
+  --resources_per_worker '{"GPU": 1, "CPU": 4}' \
+  --save_steps 500 \
+  --log_steps 20 \
+  --output_dir ./checkpoints/350m_2x12gb_ray
+
+# Notes:
+# - BF16 will automatically fall back to FP16 on GPUs that don't support BF16
+# - Adjust batch_size/accumulation/sequence_length if you see OOMs
+```
+
 ### Memory Feasibility Check
 
 Before running expensive training, check if your configuration fits in memory:
@@ -59,6 +83,13 @@ The script will show detailed memory breakdown and feasibility analysis.
 - **3B**: `batch_size=8`, `gradient_accumulation_steps=2-4`
 - **7B**: `batch_size=4`, `gradient_accumulation_steps=4-8`
 - **8B**: `batch_size=2`, `gradient_accumulation_steps=8-16`
+
+## Memory Guidelines for 12GB GPUs (e.g., Titan 12GB)
+
+- **125M**: `batch_size=8-16`, `sequence_length=1024-2048`
+- **350M**: `batch_size=2-4`, `sequence_length=1024-2048`
+- **1.3B**: `batch_size=1`, `sequence_length=1024`; set `gradient_accumulation_steps=8-16`
+- **3B+**: Not recommended on 12GB without ZeRO/FSDP offload
 
 ## Key Arguments
 

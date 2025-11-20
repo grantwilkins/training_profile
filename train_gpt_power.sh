@@ -15,47 +15,24 @@ echo "NVML logging to $LOG (pid=$SMI_PID)"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
 
-# ----- start training -----
-CMD=(torchrun --standalone --nproc_per_node 8 train_gpt.py \
-    --model_size 8B \
-    --sequence_length 2048 \
-    --batch_size 1 \
-    --gradient_accumulation_steps 2 \
-    --precision bf16 \
-    --max_steps 4000 \
-    --use_flash_attn \
-    --use_fused_optimizer \
-    --output_dir /datadrive/ \
-    --log_steps 20 \
-    --save_steps 1000 \
-    --monitor_memory \
-    --log_timing)
-
-"${CMD[@]}" &
-TRAIN_PID=$!
-
-# give the job 10 min to warm‑up
-sleep 600
-
-# ----- synchronisation stall (SIGSTOP rank 0) -----
-echo "Simulating sync‑stall (STOP rank 0)" >&2
-RANK0=$(ps -e -o pid,cmd | grep 'train_gpt.py' | grep -v grep | head -n1 | awk '{print $1}')
-kill -STOP "$RANK0"
-sleep 5
-kill -CONT "$RANK0"
-
-echo "Resumed rank 0" >&2
-sleep 60
-
-# ----- fail‑stop crash (SIGKILL rank 1) -----
-echo "Simulating fail‑stop (KILL rank 1)" >&2
-RANK1=$(ps -e -o pid,cmd | grep 'train_gpt.py' | grep -v grep | head -n2 | tail -n1 | awk '{print $1}')
-kill -9 "$RANK1"
-
-# wait for torchrun to propagate failure
-wait "$TRAIN_PID" || true
-
-sleep 30
+# ----- start training (Ray Train) -----
+python3 train_gpt.py \
+  --model_size 350M \
+  --sequence_length 1024 \
+  --batch_size 2 \
+  --gradient_accumulation_steps 4 \
+  --precision bf16 \
+  --max_steps 4000 \
+  --use_flash_attn \
+  --use_fused_optimizer \
+  --output_dir /datadrive/ \
+  --log_steps 20 \
+  --save_steps 1000 \
+  --monitor_memory \
+  --log_timing \
+  --resources_per_worker '{"GPU": 1, "CPU": 4}' \
+  --num_workers 0 \
+  --ray_address auto || true
 
 echo "Training finished; stopping NVML logger" >&2
 kill -9 "$SMI_PID"

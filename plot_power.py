@@ -20,11 +20,11 @@ plt.rcParams.update(
         "text.usetex": True,  # Use LaTeX to write all text
         "font.family": "serif",
         "font.serif": ["Linux Libertine O"],  # Specify the Libertine font
-        "axes.labelsize": 9,  # LaTeX default is 10pt font.
-        "font.size": 12,
+        "axes.labelsize": 14,  # LaTeX default is 10pt font.
+        "font.size": 14,
         "legend.fontsize": 12,
-        "xtick.labelsize": 10,
-        "ytick.labelsize": 10,
+        "xtick.labelsize": 14,
+        "ytick.labelsize": 14,
         "text.latex.preamble": r"\usepackage{libertine} \usepackage[libertine]{newtxmath}",  # Load libertine font
     }
 )
@@ -75,7 +75,7 @@ def plot_power_trace(df, output_file=None):
     plt.figure(figsize=(5, 3))
 
     # Plot total power consumption
-    plt.plot(df["time_seconds"], df["power_watts"], color="green")
+    plt.plot(df["time_seconds"], df["power_watts"], color="red")
     plt.ylabel("Server Power (W)", fontsize=12)
     plt.xlabel("Time (s)", fontsize=12)
     plt.xlim(0, df["time_seconds"].max())
@@ -92,8 +92,8 @@ def plot_power_trace(df, output_file=None):
 
 
 def main():
-    csv_file = "ckpt1000.csv"
-    output_file = "power_trace_plot_1000epoch.pdf"
+    csv_file = "ckpt500.csv"
+    output_file = "power_trace_plot_500epoch.pdf"
 
     print(f"Processing power data from: {csv_file}")
 
@@ -107,7 +107,7 @@ def main():
     # Create the plot
     plot_power_trace(df, output_file)
     df.drop(columns=["group"], inplace=True)  # Clean up the DataFrame
-    df.to_csv("aggregated_power_data_1000stepsync.csv", index=False)
+    df.to_csv("aggregated_power_data_500stepsync.csv", index=False)
 
 
 if __name__ == "__main__":

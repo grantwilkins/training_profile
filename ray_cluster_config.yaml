@@ -1,0 +1,80 @@
+# Ray Cluster Configuration for Multi-Node GPT Training
+# This configuration sets up a Ray cluster with 2 nodes for power profiling experiments
+
+cluster_name: gpt-power-profiling
+
+max_workers: 1
+
+# Cloud provider configuration (use 'local' for on-premise or manual setup)
+provider:
+    type: local
+    head_ip: YOUR_HEAD_NODE_IP  # Replace with actual head node IP
+    worker_ips:
+        - YOUR_WORKER_NODE_IP   # Replace with actual worker node IP
+
+# Authentication for SSH access to nodes
+auth:
+    ssh_user: YOUR_USERNAME     # Replace with your SSH username
+    ssh_private_key: ~/.ssh/id_rsa  # Path to your SSH private key
+
+# Files or directories to sync to all nodes
+file_mounts: {}
+
+# How Ray will sync files across nodes
+rsync_exclude: []
+rsync_filter: []
+
+# Cluster-wide configuration
+setup_commands:
+    # Install Ray if not already installed
+    - pip install -U "ray[train]" torch transformers datasets flash-attn
+
+# Commands to run on the head node only
+head_setup_commands: []
+
+# Commands to run on worker nodes only
+worker_setup_commands: []
+
+# Ray start commands for head and worker nodes
+head_start_ray_commands:
+    - ray stop
+    - >-
+      ray start
+      --head
+      --port=6379
+      --dashboard-host=0.0.0.0
+      --dashboard-port=8265
+      --num-gpus=2
+      --num-cpus=4
+      --object-store-memory=100000000000
+
+worker_start_ray_commands:
+    - ray stop
+    - >-
+      ray start
+      --address=$RAY_HEAD_IP:6379
+      --num-gpus=2
+      --num-cpus=4
+      --object-store-memory=100000000000
+
+# Cluster idle timeout (in minutes)
+idle_timeout_minutes: 60
+
+# Docker configuration (optional, if using containers)
+docker: {}
+
+# Resource configuration per node
+available_node_types:
+    head_node:
+        resources: {"CPU": 4, "GPU": 2}
+        node_config: {}
+        min_workers: 0
+        max_workers: 0
+
+    worker_node:
+        resources: {"CPU": 4, "GPU": 2}
+        node_config: {}
+        min_workers: 1
+        max_workers: 1
+
+head_node_type: head_node
