@@ -1,9 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# 2 GPU training on Titan X (no Ray overhead)
-# Uses native PyTorch DDP via torchrun
-
+conda init
+conda activate titanx
 torchrun --nproc_per_node=2 train_gpt_simple.py \
   --model_size 125M \
   --batch_size 1 \
