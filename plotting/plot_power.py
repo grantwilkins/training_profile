@@ -31,9 +31,17 @@ plt.rcParams.update(
 def parse_power_data(csv_file):
     df = pd.read_csv(csv_file)
     df.columns = df.columns.str.strip()
-    df["power_watts"] = df["power.draw [W]"].astype(float)
+    df["power_watts"] = (
+        df["power.draw [W]"].astype(float)
+        if "power.draw [W]" in df.columns
+        else df["power_watts"]
+    )
 
-    df["datetime"] = pd.to_datetime(df["timestamp"], format="%Y/%m/%d %H:%M:%S.%f")
+    df["datetime"] = (
+        pd.to_datetime(df["timestamp"], format="%Y/%m/%d %H:%M:%S.%f")
+        if "timestamp" in df.columns
+        else pd.to_datetime(df["datetime"])
+    )
 
     df["group"] = df.index // 2
     aggregated = (
@@ -59,12 +67,12 @@ def plot_power_trace(df, output_file=None):
     matplotlib.rcParams["pdf.fonttype"] = 42
     matplotlib.rcParams["ps.fonttype"] = 42
     matplotlib.rcParams["font.family"] = "Times New Roman"
-    matplotlib.rcParams["text.usetex"] = True
+    plt.rcParams["font.family"] = "Times New Roman"
     plt.plot(df["time_seconds"], df["power_watts"], color="red")
     plt.ylabel("Server Power (W)", fontsize=12)
     plt.xlabel("Time (s)", fontsize=12)
     plt.xlim(0, df["time_seconds"].max())
-    plt.ylim(0, 300)
+    plt.ylim(0, 500)
     plt.grid(True)
 
     plt.tight_layout()
@@ -77,8 +85,8 @@ def plot_power_trace(df, output_file=None):
 
 
 def main():
-    csv_file = "log.csv"
-    output_file = "titanx_power_trace.pdf"
+    csv_file = "../titanx-traces/power-trace_2gpu_2025-12-02-20-18-19.csv"
+    output_file = f"../{csv_file.split('/')[-1].split('.')[0]}.pdf"
 
     print(f"Processing power data from: {csv_file}")
 
@@ -91,7 +99,10 @@ def main():
 
     plot_power_trace(df, output_file)
     df.drop(columns=["group"], inplace=True)
-    df.to_csv("titanx_power_trace.csv", index=False)
+    df.to_csv(
+        f"../titanx-traces/{csv_file.split('/')[-1].split('.')[0]}_processed.csv",
+        index=False,
+    )
 
 
 if __name__ == "__main__":
