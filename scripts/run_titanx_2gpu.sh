@@ -6,11 +6,11 @@ nvidia-smi --query-gpu=timestamp,power.draw,utilization.gpu,memory.used --format
 SMI_PID=$!
 torchrun --nproc_per_node=2 ../training/train_gpt_simple.py \
   --model_size 350M \
-  --batch_size 1 \
+  --batch_size 8 \
   --sequence_length 256 \
   --gradient_accumulation_steps 1 \
   --precision fp32 \
-  --max_steps 4000 \
+  --max_steps 1000 \
   --save_steps 250 \
   --log_steps 10 \
   --dataset dummy
