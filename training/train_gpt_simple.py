@@ -431,12 +431,15 @@ def main():
             # Optimizer step
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if scaler:
+                    scaler.unscale_(optim)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     scaler.step(optim)
                     scaler.update()
                 else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optim.step()
 
-                optim.zero_grad()
+                optim.zero_grad(set_to_none=True)
                 sched.step()
 
             # Logging
