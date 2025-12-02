@@ -19,13 +19,11 @@ plt.rcParams.update(
     {
         "text.usetex": True,  # Use LaTeX to write all text
         "font.family": "serif",
-        "font.serif": ["Linux Libertine O"],  # Specify the Libertine font
         "axes.labelsize": 14,  # LaTeX default is 10pt font.
         "font.size": 14,
         "legend.fontsize": 12,
         "xtick.labelsize": 14,
         "ytick.labelsize": 14,
-        "text.latex.preamble": r"\usepackage{libertine} \usepackage[libertine]{newtxmath}",  # Load libertine font
     }
 )
 
@@ -58,6 +56,10 @@ def parse_power_data(csv_file):
 
 def plot_power_trace(df, output_file=None):
     plt.figure(figsize=(5, 3))
+    matplotlib.rcParams["pdf.fonttype"] = 42
+    matplotlib.rcParams["ps.fonttype"] = 42
+    matplotlib.rcParams["font.family"] = "Times New Roman"
+    matplotlib.rcParams["text.usetex"] = True
     plt.plot(df["time_seconds"], df["power_watts"], color="red")
     plt.ylabel("Server Power (W)", fontsize=12)
     plt.xlabel("Time (s)", fontsize=12)
@@ -87,9 +89,8 @@ def main():
         f"Processed {len(df)} time points (aggregated from {len(df) * 8} GPU readings)"
     )
 
-    # Create the plot
     plot_power_trace(df, output_file)
-    df.drop(columns=["group"], inplace=True)  # Clean up the DataFrame
+    df.drop(columns=["group"], inplace=True)
     df.to_csv("titanx_power_trace.csv", index=False)
 
 
