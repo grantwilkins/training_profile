@@ -127,9 +127,6 @@ def parse_args():
     return p.parse_args()
 
 
-# ———————————————————————————— Memory utils ————————————————————————————
-
-
 def calc_mem(
     cfg: ModelConfig, bs: int, seqlen: int, prec: str, ckpt: bool
 ) -> Dict[str, float]:
@@ -182,9 +179,6 @@ def log_mem(step: int):
     alloc = torch.cuda.memory_allocated() / 1024**3
     resv = torch.cuda.memory_reserved() / 1024**3
     print(f"[MEM] step {step}: alloc={alloc:.2f} GB resv={resv:.2f} GB")
-
-
-# ———————————————————————————— Model ————————————————————————————
 
 
 def build_model(cfg: ModelConfig, base: str):
@@ -350,11 +344,13 @@ def main():
         effective_precision = "fp16"
 
     # Memory check
-    gpu_total_gb = (
-        torch.cuda.get_device_properties(local_rank).total_memory / 1024**3
-    )
+    gpu_total_gb = torch.cuda.get_device_properties(local_rank).total_memory / 1024**3
     mem = calc_mem(
-        cfg, args.batch_size, args.sequence_length, effective_precision, args.gradient_checkpointing
+        cfg,
+        args.batch_size,
+        args.sequence_length,
+        effective_precision,
+        args.gradient_checkpointing,
     )
     fit = check_fit(mem, gpu_total_gb)
 
@@ -393,13 +389,13 @@ def main():
 
     # Optimizer
     params = [p for p in model.parameters() if p.requires_grad]
-    optim = torch.optim.AdamW(params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    optim = torch.optim.AdamW(
+        params, lr=args.learning_rate, weight_decay=args.weight_decay
+    )
 
     sched = get_cosine_schedule_with_warmup(optim, args.warmup_steps, args.max_steps)
 
-    scaler = (
-        torch.cuda.amp.GradScaler() if effective_precision == "fp16" else None
-    )
+    scaler = torch.cuda.amp.GradScaler() if effective_precision == "fp16" else None
 
     # Training loop
     step = 0
