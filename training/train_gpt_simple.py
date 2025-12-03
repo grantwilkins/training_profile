@@ -251,10 +251,10 @@ class GpuBurner:
     def _init_buffers(self):
         free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
 
-        # Use 50% of free memory minus 500MB safety margin
-        # More aggressive to ensure burn matches training power
-        safety_margin_bytes = 500 * 1024 * 1024  # 500 MB
-        target_bytes = int(free_bytes * 0.5 - safety_margin_bytes)
+        # Use 25% of free memory minus 1GB safety margin
+        # Conservative to avoid interfering with training memory usage
+        safety_margin_bytes = 1024 * 1024 * 1024  # 1 GB
+        target_bytes = int(free_bytes * 0.25 - safety_margin_bytes)
 
         if target_bytes <= 0:
             # Not enough free memory, use smaller buffer but not minimal
