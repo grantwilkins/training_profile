@@ -72,7 +72,7 @@ def plot_power_trace(df, output_file=None):
     plt.ylabel("Server Power (W)", fontsize=12)
     plt.xlabel("Time (s)", fontsize=12)
     plt.xlim(0, df["time_seconds"].max())
-    plt.ylim(0, 500)
+    plt.ylim(0, 600)
     plt.grid(True)
 
     plt.tight_layout()
@@ -85,7 +85,7 @@ def plot_power_trace(df, output_file=None):
 
 
 def main():
-    csv_file = "../titanx-traces/power-trace_2gpu_2025-12-02-20-18-19.csv"
+    csv_file = "../titanx-traces/power-trace_2gpu_2025-12-02-20-55-28.csv"
     output_file = f"../{csv_file.split('/')[-1].split('.')[0]}.pdf"
 
     print(f"Processing power data from: {csv_file}")
