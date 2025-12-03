@@ -723,6 +723,11 @@ def main():
             if is_ckpt_step:
                 ckpt_path = os.path.join(args.output_dir, f"checkpoint_{step}.pt")
 
+                # Start burn on non-rank-0 GPUs before they hit the barrier
+                if args.smooth_power and args.enable_ckpt_burn and burner is not None:
+                    if rank != 0:
+                        burner.start_burn_thread()
+
                 if rank == 0:
                     t_ckpt0 = time.time()
                     torch.save(
@@ -740,14 +745,14 @@ def main():
                     ckpt_time = t_ckpt1 - t_ckpt0
                     print(f"Saved checkpoint: {ckpt_path} (took {ckpt_time:.2f}s)")
 
-                # Synchronize all ranks
+                # Synchronize all ranks (non-rank-0 burns while waiting)
+                # Optionally, rank 0 can also burn during the barrier wait
                 if world_size > 1:
+                    if args.smooth_power and args.enable_ckpt_burn and burner is not None and rank == 0:
+                        burner.start_burn_thread()
                     torch.distributed.barrier()
-
-                # Optional: short burn after checkpoint to smooth power dip
-                if args.smooth_power and args.enable_ckpt_burn and burner is not None:
-                    # Brief 2-second burn to fill power gap after checkpoint I/O
-                    burner.burn_for(2.0, phase="checkpoint")
+                    if args.smooth_power and args.enable_ckpt_burn and burner is not None:
+                        burner.stop_burn_thread(join=True)
 
             step += 1
 
