@@ -1,6 +1,6 @@
 
 DATE_TIME=$(date '+%Y-%m-%d-%H-%M-%S')
-LOG=../titanx-traces/power-trace_2gpu_${DATE_TIME}.csv
+LOG=../titanx-traces/power-trace_2gpu_with_burn_${DATE_TIME}.csv
 
 nvidia-smi --query-gpu=timestamp,power.draw,utilization.gpu,memory.used --format=csv -lms 100 >> "$LOG" &
 SMI_PID=$!
@@ -13,8 +13,10 @@ torchrun --nproc_per_node=2 ../training/train_gpt_simple.py \
   --max_steps 1000 \
   --save_steps 100 \
   --log_steps 10 \
-  --dataset wikitext
+  --dataset wikitext \
+  --smooth_power \
+  --enable_ckpt_burn 
 
-sleep 60
+sleep 60 # wait for the training to stop before killing the SMI process
 
 kill -9 "$SMI_PID"
