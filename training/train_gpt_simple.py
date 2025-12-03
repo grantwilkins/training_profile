@@ -251,21 +251,40 @@ class GpuBurner:
     def _init_buffers(self):
         free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
 
-        # Use 50% of free memory minus 100 safety margin
-        safety_margin_bytes = 100 * 1024 * 1024  # 100 MB
-        target_bytes = int(free_bytes * 0.9 - safety_margin_bytes)
-        target_bytes = max(0, target_bytes)  # Ensure non-negative
+        # Use 20% of free memory minus 1GB safety margin (very conservative)
+        safety_margin_bytes = 1024 * 1024 * 1024  # 1 GB
+        target_bytes = int(free_bytes * 0.2 - safety_margin_bytes)
 
-        # Approximate: 2 * n^2 * bytes_per_elem live in a matmul
-        bytes_per_elem = torch.finfo(self.dtype).bits // 8
-        n = int((target_bytes / (2 * bytes_per_elem)) ** 0.5)
+        if target_bytes <= 0:
+            # Not enough free memory, use minimal buffer
+            n = 128
+            print(f"[WARN] Very low free memory ({free_bytes / 1024**3:.2f} GB), using minimal burn buffer")
+        else:
+            # Approximate: 2 * n^2 * bytes_per_elem live in a matmul
+            bytes_per_elem = torch.finfo(self.dtype).bits // 8
+            n = int((target_bytes / (2 * bytes_per_elem)) ** 0.5)
 
-        # Round to a reasonable multiple to avoid weird tile sizes
-        n = max(128, (n // 128) * 128)
+            # Round to a reasonable multiple to avoid weird tile sizes
+            n = max(128, (n // 128) * 128)
 
         self.n = n
-        self.a = torch.randn(n, n, device=self.device, dtype=self.dtype)
-        self.b = torch.randn(n, n, device=self.device, dtype=self.dtype)
+        buffer_size_gb = 2 * n * n * torch.finfo(self.dtype).bits // 8 / 1024**3
+
+        try:
+            self.a = torch.randn(n, n, device=self.device, dtype=self.dtype)
+            self.b = torch.randn(n, n, device=self.device, dtype=self.dtype)
+            print(f"[BURN] Allocated {buffer_size_gb:.2f} GB burn buffer (n={n}, free={free_bytes/1024**3:.2f} GB)")
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                # Fallback to even smaller buffer
+                torch.cuda.empty_cache()
+                n = 128
+                self.n = n
+                self.a = torch.randn(n, n, device=self.device, dtype=self.dtype)
+                self.b = torch.randn(n, n, device=self.device, dtype=self.dtype)
+                print(f"[WARN] OOM during buffer allocation, using minimal buffer (n={n})")
+            else:
+                raise
 
     # ---------- blocking burn for a fixed duration ----------
 
