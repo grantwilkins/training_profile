@@ -141,7 +141,7 @@ def parse_args():
     p.add_argument(
         "--warmup_segments",
         type=int,
-        default=60,
+        default=30,
         help="Number of segments for warmup ramp shaping (more = smoother).",
     )
     p.add_argument(
@@ -153,7 +153,7 @@ def parse_args():
     p.add_argument(
         "--cooldown_segments",
         type=int,
-        default=60,
+        default=30,
         help="Number of segments for cooldown ramp shaping (more = smoother).",
     )
     p.add_argument(
@@ -251,21 +251,31 @@ class GpuBurner:
     def _init_buffers(self):
         free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
 
-        # Use 20% of free memory minus 1GB safety margin (very conservative)
-        safety_margin_bytes = 1024 * 1024 * 1024  # 1 GB
-        target_bytes = int(free_bytes * 0.2 - safety_margin_bytes)
+        # Use 50% of free memory minus 500MB safety margin
+        # More aggressive to ensure burn matches training power
+        safety_margin_bytes = 500 * 1024 * 1024  # 500 MB
+        target_bytes = int(free_bytes * 0.5 - safety_margin_bytes)
 
         if target_bytes <= 0:
-            # Not enough free memory, use minimal buffer
-            n = 128
-            print(f"[WARN] Very low free memory ({free_bytes / 1024**3:.2f} GB), using minimal burn buffer")
+            # Not enough free memory, use smaller buffer but not minimal
+            # Even small burns need to be somewhat effective
+            target_bytes = int(free_bytes * 0.3)
+            if target_bytes <= 0:
+                n = 512  # Minimum effective size (not 128!)
+                print(
+                    f"[WARN] Very low free memory ({free_bytes / 1024**3:.2f} GB), using reduced burn buffer"
+                )
+            else:
+                bytes_per_elem = torch.finfo(self.dtype).bits // 8
+                n = int((target_bytes / (2 * bytes_per_elem)) ** 0.5)
+                n = max(512, (n // 128) * 128)
         else:
             # Approximate: 2 * n^2 * bytes_per_elem live in a matmul
             bytes_per_elem = torch.finfo(self.dtype).bits // 8
             n = int((target_bytes / (2 * bytes_per_elem)) ** 0.5)
 
             # Round to a reasonable multiple to avoid weird tile sizes
-            n = max(128, (n // 128) * 128)
+            n = max(512, (n // 128) * 128)
 
         self.n = n
         buffer_size_gb = 2 * n * n * torch.finfo(self.dtype).bits // 8 / 1024**3
@@ -273,16 +283,29 @@ class GpuBurner:
         try:
             self.a = torch.randn(n, n, device=self.device, dtype=self.dtype)
             self.b = torch.randn(n, n, device=self.device, dtype=self.dtype)
-            print(f"[BURN] Allocated {buffer_size_gb:.2f} GB burn buffer (n={n}, free={free_bytes/1024**3:.2f} GB)")
+            print(
+                f"[BURN] Allocated {buffer_size_gb:.2f} GB burn buffer (n={n}, free={free_bytes / 1024**3:.2f} GB)"
+            )
         except RuntimeError as e:
             if "out of memory" in str(e):
-                # Fallback to even smaller buffer
+                # Fallback: try progressively smaller buffers
                 torch.cuda.empty_cache()
-                n = 128
-                self.n = n
-                self.a = torch.randn(n, n, device=self.device, dtype=self.dtype)
-                self.b = torch.randn(n, n, device=self.device, dtype=self.dtype)
-                print(f"[WARN] OOM during buffer allocation, using minimal buffer (n={n})")
+                for fallback_n in [2048, 1024, 512]:
+                    try:
+                        self.n = fallback_n
+                        self.a = torch.randn(
+                            fallback_n, fallback_n, device=self.device, dtype=self.dtype
+                        )
+                        self.b = torch.randn(
+                            fallback_n, fallback_n, device=self.device, dtype=self.dtype
+                        )
+                        print(
+                            f"[WARN] OOM during buffer allocation, using fallback buffer (n={fallback_n})"
+                        )
+                        return
+                    except RuntimeError:
+                        continue
+                raise RuntimeError(f"Cannot allocate even minimal burn buffer")
             else:
                 raise
 
@@ -723,7 +746,8 @@ def main():
             if is_ckpt_step:
                 ckpt_path = os.path.join(args.output_dir, f"checkpoint_{step}.pt")
 
-                # Start burn on non-rank-0 GPUs before they hit the barrier
+                # Start burn on non-rank-0 GPUs IMMEDIATELY before they hit the barrier
+                # This keeps them hot during the entire checkpoint window
                 if args.smooth_power and args.enable_ckpt_burn and burner is not None:
                     if rank != 0:
                         burner.start_burn_thread()
@@ -746,12 +770,13 @@ def main():
                     print(f"Saved checkpoint: {ckpt_path} (took {ckpt_time:.2f}s)")
 
                 # Synchronize all ranks (non-rank-0 burns while waiting)
-                # Optionally, rank 0 can also burn during the barrier wait
                 if world_size > 1:
-                    if args.smooth_power and args.enable_ckpt_burn and burner is not None and rank == 0:
-                        burner.start_burn_thread()
                     torch.distributed.barrier()
-                    if args.smooth_power and args.enable_ckpt_burn and burner is not None:
+
+                # Stop burn on non-rank-0 GPUs
+                # Do NOT burn on rank 0 here to avoid power spike
+                if args.smooth_power and args.enable_ckpt_burn and burner is not None:
+                    if rank != 0:
                         burner.stop_burn_thread(join=True)
 
             step += 1
