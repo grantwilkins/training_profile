@@ -719,13 +719,9 @@ def main():
                 )
                 log_mem(step)
 
-            # Checkpointing with optional burn during I/O / barrier
+            # Checkpointing
             if is_ckpt_step:
                 ckpt_path = os.path.join(args.output_dir, f"checkpoint_{step}.pt")
-
-                # Start burn thread on all ranks if enabled
-                if args.smooth_power and args.enable_ckpt_burn and burner is not None:
-                    burner.start_burn_thread()
 
                 if rank == 0:
                     t_ckpt0 = time.time()
@@ -744,13 +740,14 @@ def main():
                     ckpt_time = t_ckpt1 - t_ckpt0
                     print(f"Saved checkpoint: {ckpt_path} (took {ckpt_time:.2f}s)")
 
-                # Synchronize all ranks so everyone burns during the stall window
+                # Synchronize all ranks
                 if world_size > 1:
                     torch.distributed.barrier()
 
-                # Stop burn threads on all ranks
+                # Optional: short burn after checkpoint to smooth power dip
                 if args.smooth_power and args.enable_ckpt_burn and burner is not None:
-                    burner.stop_burn_thread(join=True)
+                    # Brief 2-second burn to fill power gap after checkpoint I/O
+                    burner.burn_for(2.0, phase="checkpoint")
 
             step += 1
 
