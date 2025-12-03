@@ -10,13 +10,13 @@ torchrun --nproc_per_node=2 ../training/train_gpt_simple.py \
   --sequence_length 256 \
   --gradient_accumulation_steps 10 \
   --precision fp32 \
-  --max_steps 1000 \
-  --save_steps 100 \
+  --max_steps 500 \
+  --save_steps 50 \
   --log_steps 10 \
   --dataset wikitext \
   --smooth_power \
   --enable_ckpt_burn 
 
-sleep 60 # wait for the training to stop before killing the SMI process
+sleep 30 # wait for the training to stop before killing the SMI process
 
 kill -9 "$SMI_PID"
