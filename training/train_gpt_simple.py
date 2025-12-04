@@ -373,10 +373,11 @@ class GPUPowerSmoother:
         num_ops = max(1, int(active_time / self.op_time_s))
 
         for _ in range(num_ops):
-            _ = torch.matmul(self.buffer_a, self.buffer_b)
+            c = torch.matmul(self.buffer_a, self.buffer_b)
+            _ = torch.matmul(c, self.buffer_a)
         torch.cuda.synchronize(self.device_id)
 
-        elapsed = num_ops * self.op_time_s
+        elapsed = num_ops * self.op_time_s * 2
         sleep_time = max(0.0, window_size - elapsed)
         if sleep_time > 0:
             time.sleep(sleep_time)
@@ -396,7 +397,7 @@ class GPUPowerSmoother:
 
     def _pulsed_burn_loop(self):
         while not self.stop_event.is_set():
-            self._run_window(self.limit_factor, 0.05)
+            self._run_window(1.0, 0.05)
 
     @contextmanager
     def busy_wait(self):
