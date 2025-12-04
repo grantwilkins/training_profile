@@ -481,7 +481,7 @@ def main():
         smoother.ramp(
             duration_s=int(args.warmup_total_s),
             direction="up",
-            start_duty=args.warmup_start_duty
+            start_duty=args.warmup_start_duty,
         )
 
     # Data

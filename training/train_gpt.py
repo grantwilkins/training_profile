@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-train_gpt.py – Multi-node Ray Train GPT training for power profiling
+train_gpt.py – High‑performance, resource‑aware GPT training on 8×H100
 =====================================================================
 
-Ray Train conversion 2025‑10‑21. Key features:
-* Multi-node distributed training with Ray Train (2+ nodes)
-* Asynchronous checkpointing with Ray's built-in checkpoint mechanism
-* Overlapping communication/computation with DDP gradient bucketing
-* Optimized for power monitoring during large-scale training
-* Flash‑Attention 2 and gradient checkpointing support
+Patched 2025‑07‑26.  Key fixes:
+* Robust streaming‑dataset dataloader with explicit `collate_fn` and `num_workers=0`.
+* Correct device placement & Flash‑Attention 2 flag.
+* DDP wrapped **before** gradient‑checkpointing so hooks are registered.
+* Optional collective barrier after each optimiser step for clean power spikes.
+* Safer LR‑scheduler stepping & checkpoint synchronisation.
+* Misc. hygiene (seed, AMP guards, skip checkpoint‑0).
 
-Usage:
-    python train_gpt.py --model_size 8B --batch_size 1 --gradient_accumulation_steps 2 --precision bf16 --max_steps 2000 --num_workers 2
+Usage (unchanged):
+    torchrun --standalone --nproc_per_node 8 train_gpt.py --model_size 8B --batch_size 1 --gradient_accumulation_steps 2 --precision bf16 --max_steps 2000
 """
 
 import argparse
@@ -24,17 +25,14 @@ import time
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
-import ray
-import ray.train
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from datasets import load_dataset
-from ray.train import CheckpointConfig, RunConfig, ScalingConfig
-from ray.train.torch import TorchTrainer
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -50,14 +48,6 @@ try:
 except ImportError:
     FLASH_ATTN_AVAILABLE = False
     print("Warning: flash‑attn not available – falling back to SDPA/eager")
-
-# Hard-disable flash-attn on pre-Ampere GPUs to avoid import/config pain
-try:
-    major_cc, _ = torch.cuda.get_device_capability(0)
-    if major_cc < 8:
-        FLASH_ATTN_AVAILABLE = False
-except Exception:
-    pass
 
 try:
     from apex.optimizers import FusedAdam  # type: ignore
@@ -92,8 +82,6 @@ class ModelConfig:
 
 
 MODEL_CONFIGS: Dict[str, ModelConfig] = {
-    "125M": ModelConfig(768, 12, 12, 3072),
-    "350M": ModelConfig(1024, 16, 24, 4096),
     "1.3B": ModelConfig(2048, 16, 24, 8192),
     "3B": ModelConfig(2560, 20, 32, 10240),
     "7B": ModelConfig(4096, 32, 32, 11008),
@@ -104,8 +92,8 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
 
 
 def parse_args():
-    p = argparse.ArgumentParser("Train GPT‑style model with Ray Train multi-node")
-    p.add_argument("--model_size", choices=list(MODEL_CONFIGS), default="350M")
+    p = argparse.ArgumentParser("Train GPT‑style model on 8×H100")
+    p.add_argument("--model_size", choices=list(MODEL_CONFIGS), default="7B")
     p.add_argument("--base_model", default="facebook/opt-125m")
 
     p.add_argument("--batch_size", type=int, default=8)
@@ -116,14 +104,14 @@ def parse_args():
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--max_steps", type=int, default=10_000)
 
-    p.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="fp16")
+    p.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="bf16")
     p.add_argument("--gradient_checkpointing", action="store_true", default=True)
 
-    p.add_argument("--use_flash_attn", action="store_true", default=False)
-    p.add_argument("--use_fused_optimizer", action="store_true", default=False)
+    p.add_argument("--use_flash_attn", action="store_true", default=True)
+    p.add_argument("--use_fused_optimizer", action="store_true", default=True)
 
     p.add_argument("--tokenizer_num_workers", type=int)
-    p.add_argument("--output_dir", default="/home/dennis/")
+    p.add_argument("--output_dir", default="/datadrive")
     p.add_argument("--save_steps", type=int, default=1000)
     p.add_argument("--log_steps", type=int, default=10)
 
@@ -137,43 +125,7 @@ def parse_args():
         help="Insert dist.barrier() every N optimiser steps (0=off)",
     )
 
-    # Ray-specific arguments
-    p.add_argument(
-        "--num_workers",
-        type=int,
-        default=1,
-        help="Number of Ray workers (processes). 0=auto (all GPUs)",
-    )
-    p.add_argument(
-        "--use_gpu", action="store_true", default=True, help="Use GPU for training"
-    )
-    p.add_argument(
-        "--resources_per_worker",
-        type=str,
-        default='{"GPU": 1, "CPU": 4}',
-        help="Resources per worker as JSON string (default 1 GPU per worker)",
-    )
-    p.add_argument(
-        "--ray_address",
-        type=str,
-        default="auto",
-        help="Ray cluster address (auto for local, or ray://<head_node_ip>:10001)",
-    )
-
-    p.add_argument(
-        "--dataset",
-        choices=["c4", "wikitext", "dummy"],
-        default="dummy",
-        help="Dataset to use: c4 (finite subset), wikitext-2, or dummy random tokens",
-    )
-
-    p.add_argument(
-        "--c4_split",
-        type=str,
-        default="train[:0.01%]",
-        help="HF split string when using C4, e.g. 'train[:0.01%]' or 'train[:10000]'",
-    )
-
+    p.add_argument("--local_rank", type=int, default=0)
     return p.parse_args()
 
 
@@ -210,7 +162,7 @@ def calc_mem(
     }
 
 
-def check_fit(mem: Dict[str, float], gpu_mem: float):
+def check_fit(mem: Dict[str, float], gpu_mem: float = 80.0):
     avail = gpu_mem * 0.9
     util = mem["total"] / gpu_mem * 100
     return {"feasible": mem["total"] <= avail, "avail": avail, "util": util}
@@ -237,23 +189,19 @@ def log_mem(step: int):
     print(f"[MEM] step {step}: alloc={alloc:.2f} GB resv={resv:.2f} GB")
 
 
-# ———————————————————————————— Ray Train helpers ————————————————————————————
+# ———————————————————————————— Distributed setup ————————————————————————————
 
 
-def get_ray_train_context():
-    """Get distributed training context from Ray Train."""
-    import ray.train.torch
-
-    # Ray Train automatically sets up the distributed process group
-    world_size = ray.train.get_context().get_world_size()
-    rank = ray.train.get_context().get_world_rank()
-    local_rank = ray.train.get_context().get_local_rank()
-
-    # Set device
-    device = torch.device("cuda", local_rank)
-    torch.cuda.set_device(device)
-
-    return world_size, rank, local_rank, device
+def setup_dist():
+    if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
+        if not dist.is_initialized():
+            dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        return dist.get_world_size(), rank, local_rank
+    else:
+        return 1, 0, 0
 
 
 # ———————————————————————————— Model creation ————————————————————————————
@@ -267,15 +215,7 @@ def build_model(cfg: ModelConfig, base: str, use_flash: bool):
     conf.intermediate_size = cfg.intermediate_size
     conf.max_position_embeddings = cfg.max_position_embeddings
 
-    # Gate Flash-Attn by GPU capability (requires SM80+)
-    can_use_flash = use_flash and FLASH_ATTN_AVAILABLE
-    try:
-        major_cc, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
-        can_use_flash = can_use_flash and major_cc >= 8
-    except Exception:
-        pass
-
-    if can_use_flash:
+    if use_flash and FLASH_ATTN_AVAILABLE:
         # Use private attribute name in recent Transformers
         setattr(conf, "_attn_implementation", "flash_attention_2")
     else:
@@ -291,108 +231,41 @@ def build_model(cfg: ModelConfig, base: str, use_flash: bool):
 # ———————————————————————————— Dataset & loader ————————————————————————————
 
 
-def build_loader(
-    tokenizer,
-    seqlen: int,
-    bs: int,
-    workers: Optional[int],
-    dataset_name: str = "c4",
-    c4_split: str = "train[:0.01%]",
-):
-    if dataset_name == "dummy":
+def build_loader(tokenizer, seqlen: int, bs: int, workers: Optional[int]):
+    ds = load_dataset(
+        "allenai/c4",
+        data_files="en/c4-train.0000*-of-01024.json.gz",
+        split="train",
+        streaming=True,
+    )
 
-        class DummyDataset(IterableDataset):
-            def __init__(self, vocab_size, seqlen):
-                self.vocab_size = vocab_size
-                self.seqlen = seqlen
-
-            def __iter__(self):
-                while True:
-                    ids = torch.randint(
-                        low=0,
-                        high=self.vocab_size,
-                        size=(self.seqlen,),
-                        dtype=torch.long,
-                    )
-                    yield {
-                        "input_ids": ids.clone(),
-                        "attention_mask": torch.ones_like(ids),
-                        "labels": ids.clone(),
-                    }
-
-        ds = DummyDataset(tokenizer.vocab_size, seqlen)
-
-        def collate(examples):
-            batch = {
-                k: torch.stack([e[k] for e in examples])
-                for k in ("input_ids", "attention_mask", "labels")
-            }
-            return batch
-
-        return DataLoader(ds, batch_size=bs, collate_fn=collate)
-
-    elif dataset_name == "wikitext":
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-
-        def tok(batch):
-            out = tokenizer(
-                batch["text"],
-                truncation=True,
-                max_length=seqlen,
-                padding="max_length",
-                add_special_tokens=True,
-            )
-            out["labels"] = [ids[:] for ids in out["input_ids"]]
-            return out
-
-        ds = ds.map(tok, batched=True, batch_size=1000, remove_columns=["text"])
-
-        def collate(examples):
-            keys = ("input_ids", "attention_mask", "labels")
-            return {
-                k: torch.tensor([e[k] for e in examples], dtype=torch.long)
-                for k in keys
-            }
-
-        return DataLoader(
-            ds, batch_size=bs, collate_fn=collate, num_workers=0, pin_memory=True
+    def tok(batch):
+        out = tokenizer(
+            batch["text"],
+            truncation=True,
+            max_length=seqlen,
+            padding="max_length",
+            add_special_tokens=True,
         )
+        out["labels"] = [ids[:] for ids in out["input_ids"]]
+        return out
 
-    else:  # "c4"
-        # Small finite subset of C4; no streaming so we can use split slicing
-        ds = load_dataset(
-            "allenai/c4",
-            "en",  # config: English subset
-            split=c4_split,  # e.g. "train[:0.01%]" or "train[:10000]"
-        )
+    # For streaming datasets `column_names` can be `None`; just drop the raw text field.
+    ds = ds.map(tok, batched=True, batch_size=1000, remove_columns=["text"])
 
-        def tok(batch):
-            out = tokenizer(
-                batch["text"],
-                truncation=True,
-                max_length=seqlen,
-                padding="max_length",
-                add_special_tokens=True,
-            )
-            out["labels"] = [ids[:] for ids in out["input_ids"]]
-            return out
+    def collate(examples):
+        # keep only token fields; meta fields (e.g. timestamps) were removed above
+        keys = ("input_ids", "attention_mask", "labels")
+        return {
+            k: torch.tensor([e[k] for e in examples], dtype=torch.long) for k in keys
+        }
 
-        ds = ds.map(tok, batched=True, batch_size=1000, remove_columns=["text"])
+    return DataLoader(
+        ds, batch_size=bs, collate_fn=collate, num_workers=0, pin_memory=True
+    )
 
-        def collate(examples):
-            keys = ("input_ids", "attention_mask", "labels")
-            return {
-                k: torch.tensor([e[k] for e in examples], dtype=torch.long)
-                for k in keys
-            }
 
-        return DataLoader(
-            ds,
-            batch_size=bs,
-            collate_fn=collate,
-            num_workers=0,
-            pin_memory=True,
-        )
+# ———————————————————————————— Optimiser ————————————————————————————
 
 
 def make_optim(model, lr, wd, use_fused):
@@ -401,16 +274,13 @@ def make_optim(model, lr, wd, use_fused):
         print("Using Apex FusedAdam")
         return FusedAdam(params, lr=lr, weight_decay=wd, betas=(0.9, 0.95))
     if use_fused and TORCH_FUSED_AVAILABLE:
-        major_cc, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
-        if major_cc >= 8:
-            print("Using PyTorch fused AdamW")
-            return torch.optim.AdamW(params, lr=lr, weight_decay=wd, fused=True)
-        else:
-            print(
-                "PyTorch fused AdamW not supported on this GPU arch; using standard AdamW"
-            )
+        print("Using PyTorch fused AdamW")
+        return torch.optim.AdamW(params, lr=lr, weight_decay=wd, fused=True)
     print("Using standard AdamW")
     return torch.optim.AdamW(params, lr=lr, weight_decay=wd)
+
+
+# ———————————————————————————— Train‑step ————————————————————————————
 
 
 def step_fn(model, batch, optim, sched, scaler, ga_steps, step, dtype, rank, timing_on):
@@ -419,7 +289,7 @@ def step_fn(model, batch, optim, sched, scaler, ga_steps, step, dtype, rank, tim
         out = model(**batch)
         loss = out.loss / ga_steps
 
-    fp16_mode = dtype == torch.float16 and scaler is not None
+    fp16_mode = dtype == torch.float16 and scaler is not None  # only valid combo
 
     with timing("bw", rank, timing_on):
         if fp16_mode:
@@ -445,97 +315,71 @@ def step_fn(model, batch, optim, sched, scaler, ga_steps, step, dtype, rank, tim
     return metrics
 
 
-def train_func(config: Dict):
-    """
-    Main training function executed on each Ray worker.
-    Ray Train automatically handles distributed setup.
-    """
-    import torch.distributed as dist
+# ———————————————————————————— Main ————————————————————————————
 
-    world_size, rank, local_rank, device = get_ray_train_context()
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def main():
+    args = parse_args()
+    set_seed()
+
+    ws, rank, local_rank = setup_dist()
+    device = torch.device("cuda", local_rank)
 
     if rank == 0:
-        print(
-            f"Ray Train context: world_size={world_size}, rank={rank}, local_rank={local_rank}"
-        )
+        print(f"World size: {ws}; device: {device}")
 
-    set_seed(config.get("seed", 42))
-
-    cfg = MODEL_CONFIGS[config["model_size"]]
-
-    requested_precision = config["precision"]
-    bf16_supported = getattr(torch.cuda, "is_bf16_supported", lambda: False)()
-    effective_precision = requested_precision
-    if requested_precision == "bf16" and not bf16_supported:
-        if rank == 0:
-            print("[WARN] bf16 not supported on this GPU, using fp16 instead.")
-        effective_precision = "fp16"
-
-    gpu_total_gb = (
-        torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
-        / 1024**3
-    )
+    cfg = MODEL_CONFIGS[args.model_size]
     mem = calc_mem(
         cfg,
-        config["batch_size"],
-        config["sequence_length"],
-        effective_precision,
-        config["gradient_checkpointing"],
+        args.batch_size,
+        args.sequence_length,
+        args.precision,
+        args.gradient_checkpointing,
     )
-    fit = check_fit(mem, gpu_total_gb)
+    fit = check_fit(mem)
     if rank == 0:
         print(json.dumps({"memory": mem, "fit": fit}, indent=2))
         if not fit["feasible"]:
-            print("[ERROR] Model+batch+sequence do not fit in GPU memory.")
-            print("Try: --model_size 125M --batch_size 1 --sequence_length 512")
-            import sys
-
-            sys.exit(1)
+            warnings.warn(
+                "Model may not fit – consider lowering batch size or enabling checkpointing."
+            )
 
     dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[
-        effective_precision
+        args.precision
     ]
-    amp = effective_precision in {"fp16", "bf16"}
+    amp = args.precision in {"fp16", "bf16"}
 
-    tokenizer = AutoTokenizer.from_pretrained(config["base_model"])
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
 
-    model = build_model(cfg, config["base_model"], config["use_flash_attn"]).to(
+    model = build_model(cfg, args.base_model, args.use_flash_attn).to(
         device, dtype=dtype
     )
-    if world_size > 1:
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            gradient_as_bucket_view=True,
-            broadcast_buffers=False,
-            bucket_cap_mb=25,
-        )
-    if config["gradient_checkpointing"]:
-        if hasattr(model, "module"):
-            model.module.gradient_checkpointing_enable()
-        else:
-            model.gradient_checkpointing_enable()
+
+    if ws > 1:
+        model = DDP(model, device_ids=[local_rank])
+    if args.gradient_checkpointing:
+        model.module.gradient_checkpointing_enable() if hasattr(
+            model, "module"
+        ) else model.gradient_checkpointing_enable()
 
     loader = build_loader(
-        tokenizer,
-        config["sequence_length"],
-        config["batch_size"],
-        config.get("tokenizer_num_workers"),
-        config.get("dataset", "dummy"),
-        config.get("c4_split", "train[:0.01%]"),
+        tokenizer, args.sequence_length, args.batch_size, args.tokenizer_num_workers
     )
-
     optim = make_optim(
-        model,
-        config["learning_rate"],
-        config["weight_decay"],
-        config["use_fused_optimizer"],
+        model, args.learning_rate, args.weight_decay, args.use_fused_optimizer
     )
-    sched = get_cosine_schedule_with_warmup(
-        optim, config["warmup_steps"], config["max_steps"]
-    )
-    scaler = torch.cuda.amp.GradScaler() if config["precision"] == "fp16" else None
+    sched = get_cosine_schedule_with_warmup(optim, args.warmup_steps, args.max_steps)
+    # GradScaler only supports fp16; for bf16 we disable scaling
+    scaler = torch.cuda.amp.GradScaler() if args.precision == "fp16" else None
+
+    os.makedirs(args.output_dir, exist_ok=True)
 
     step = 0
     data_iter = iter(loader)
@@ -543,9 +387,9 @@ def train_func(config: Dict):
     torch.cuda.synchronize()
     t0 = time.time()
 
-    while step < config["max_steps"]:
+    while step < args.max_steps:
         try:
-            with timing("data", rank, config["log_timing"]):
+            with timing("data", rank, args.log_timing):
                 batch = next(data_iter)
             batch = {k: v.to(device) for k, v in batch.items()}
 
@@ -557,11 +401,11 @@ def train_func(config: Dict):
                         optim,
                         sched,
                         scaler,
-                        config["gradient_accumulation_steps"],
+                        args.gradient_accumulation_steps,
                         step,
                         dtype,
                         rank,
-                        config["log_timing"],
+                        args.log_timing,
                     )
             else:
                 metrics = step_fn(
@@ -570,44 +414,49 @@ def train_func(config: Dict):
                     optim,
                     sched,
                     None,
-                    config["gradient_accumulation_steps"],
+                    args.gradient_accumulation_steps,
                     step,
                     dtype,
                     rank,
-                    config["log_timing"],
+                    args.log_timing,
                 )
 
-            if step % config["log_steps"] == 0 and rank == 0:
+            if step % args.log_steps == 0 and rank == 0:
                 print(
                     f"step {step}: loss={metrics['loss']:.4f} lr={metrics.get('lr', 0):.2e}"
                 )
-                if config["monitor_memory"]:
+                if args.monitor_memory:
                     log_mem(step)
 
-            if config["barrier_every"] and (step + 1) % config["barrier_every"] == 0:
-                if dist.is_initialized():
-                    dist.barrier()
+            # barrier for clean power plateau
+            if (
+                args.barrier_every
+                and (step + 1) % args.barrier_every == 0
+                and dist.is_initialized()
+            ):
+                dist.barrier()
 
-            if step > 0 and step % config["save_steps"] == 0:
-                if rank == 0:
-                    checkpoint_dict = {
+            # checkpoint (skip step 0)
+            if step and step % args.save_steps == 0 and rank == 0:
+                torch.cuda.synchronize()
+                ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
+                os.makedirs(ckpt_dir, exist_ok=True)
+                (model.module if hasattr(model, "module") else model).save_pretrained(
+                    ckpt_dir
+                )
+                tokenizer.save_pretrained(ckpt_dir)
+                torch.save(
+                    {
                         "step": step,
-                        "model_state": (
-                            model.module if hasattr(model, "module") else model
-                        ).state_dict(),
-                        "optim_state": optim.state_dict(),
-                        "sched_state": sched.state_dict(),
-                        "scaler_state": scaler.state_dict() if scaler else None,
-                    }
-                    ray.train.report(
-                        metrics={"step": step, "loss": metrics["loss"]},
-                        checkpoint=ray.train.Checkpoint.from_dict(checkpoint_dict),
-                    )
-                else:
-                    ray.train.report(metrics={"step": step, "loss": metrics["loss"]})
+                        "optim": optim.state_dict(),
+                        "sched": sched.state_dict(),
+                        "scaler": scaler.state_dict() if scaler else None,
+                    },
+                    os.path.join(ckpt_dir, "state.pt"),
+                )
+                torch.cuda.synchronize()
 
             step += 1
-
         except StopIteration:
             data_iter = iter(loader)
         except KeyboardInterrupt:
@@ -618,132 +467,8 @@ def train_func(config: Dict):
     torch.cuda.synchronize()
     if rank == 0:
         print(f"Done {step} steps in {time.time() - t0:.1f}s")
-
-    if rank == 0:
-        checkpoint_dict = {
-            "step": step,
-            "model_state": (
-                model.module if hasattr(model, "module") else model
-            ).state_dict(),
-            "optim_state": optim.state_dict(),
-            "sched_state": sched.state_dict(),
-            "scaler_state": scaler.state_dict() if scaler else None,
-        }
-        ray.train.report(
-            metrics={"step": step, "loss": metrics.get("loss", 0.0), "done": True},
-            checkpoint=ray.train.Checkpoint.from_dict(checkpoint_dict),
-        )
-
-
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def main():
-    args = parse_args()
-
-    if not ray.is_initialized():
-        if args.ray_address == "auto":
-            ray.init()
-        else:
-            ray.init(address=args.ray_address)
-
-    print(f"Ray cluster resources: {ray.cluster_resources()}")
-
-    resources_per_worker = json.loads(args.resources_per_worker)
-
-    if args.num_workers <= 0:
-        total_gpus = int(ray.cluster_resources().get("GPU", 0))
-        if total_gpus == 0:
-            raise RuntimeError(
-                "No GPUs found in Ray cluster. Please check your GPU availability."
-            )
-        gpus_per_worker = int(resources_per_worker.get("GPU", 1)) or 1
-        auto_workers = max(1, total_gpus // gpus_per_worker)
-        print(
-            f"Auto-selecting num_workers={auto_workers} (GPUs={total_gpus}, per_worker={gpus_per_worker})"
-        )
-        args.num_workers = auto_workers
-
-    # Titan X-friendly override (12 GB, sm_52)
-    if args.model_size == "8B":
-        print("[WARN] 8B model too large for Titan X (12GB), using 125M instead")
-        args.model_size = "125M"
-    if args.batch_size > 1:
-        print(
-            f"[WARN] Batch size {args.batch_size} may be too large for Titan X, clamping to 1"
-        )
-        args.batch_size = 1
-    if args.sequence_length > 512:
-        print(
-            f"[WARN] Sequence length {args.sequence_length} may be too large for Titan X, clamping to 512"
-        )
-        args.sequence_length = 512
-
-    # Prepare training config
-    train_config = {
-        "model_size": args.model_size,
-        "base_model": args.base_model,
-        "batch_size": args.batch_size,
-        "sequence_length": args.sequence_length,
-        "gradient_accumulation_steps": args.gradient_accumulation_steps,
-        "learning_rate": args.learning_rate,
-        "weight_decay": args.weight_decay,
-        "warmup_steps": args.warmup_steps,
-        "max_steps": args.max_steps,
-        "precision": args.precision,
-        "gradient_checkpointing": args.gradient_checkpointing,
-        "use_flash_attn": args.use_flash_attn,
-        "use_fused_optimizer": args.use_fused_optimizer,
-        "tokenizer_num_workers": args.tokenizer_num_workers,
-        "save_steps": args.save_steps,
-        "log_steps": args.log_steps,
-        "monitor_memory": args.monitor_memory,
-        "log_timing": args.log_timing,
-        "barrier_every": args.barrier_every,
-        "dataset": args.dataset,
-        "c4_split": args.c4_split,
-        "seed": 42,
-    }
-
-    # Configure Ray Train scaling
-    scaling_config = ScalingConfig(
-        num_workers=args.num_workers,
-        use_gpu=args.use_gpu,
-        resources_per_worker=resources_per_worker,
-    )
-
-    # Configure checkpointing
-    checkpoint_config = CheckpointConfig(
-        num_to_keep=3,  # Keep last 3 checkpoints
-        checkpoint_score_attribute="step",
-        checkpoint_score_order="max",
-    )
-
-    # Configure run
-    run_config = RunConfig(
-        name="gpt_power_profiling",
-        storage_path=args.output_dir,
-        checkpoint_config=checkpoint_config,
-    )
-
-    # Create Ray TorchTrainer
-    trainer = TorchTrainer(
-        train_loop_per_worker=train_func,
-        train_loop_config=train_config,
-        scaling_config=scaling_config,
-        run_config=run_config,
-    )
-
-    # Start training
-    print(f"Starting Ray Train with {args.num_workers} workers...")
-    result = trainer.fit()
-
-    print("Training complete!")
-    print(f"Final checkpoint: {result.checkpoint}")
-    print(f"Metrics: {result.metrics}")
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
