@@ -15,7 +15,6 @@ Usage (2 GPUs):
 
 import argparse
 import json
-import math
 import os
 
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION_IMPORTS", "1")
@@ -126,41 +125,12 @@ def parse_args():
         help="C4 split (e.g. 'train[:10000]')",
     )
 
-    # Power smoothing / synthetic burn
-    p.add_argument(
-        "--smooth_power",
-        action="store_true",
-        help="Enable synthetic GPU burn to smooth power ramps and raise dips.",
-    )
-    p.add_argument(
-        "--warmup_total_s",
-        type=float,
-        default=30.0,
-        help="Total duration (seconds) of pre-training startup warmup burn.",
-    )
-    p.add_argument(
-        "--warmup_segments",
-        type=int,
-        default=30,
-        help="Number of segments for warmup ramp shaping (more = smoother).",
-    )
-    p.add_argument(
-        "--cooldown_total_s",
-        type=float,
-        default=30.0,
-        help="Total duration (seconds) of post-training cooldown burn.",
-    )
-    p.add_argument(
-        "--cooldown_segments",
-        type=int,
-        default=30,
-        help="Number of segments for cooldown ramp shaping (more = smoother).",
-    )
-    p.add_argument(
-        "--enable_ckpt_burn",
-        action="store_true",
-        help="If set, burn GPU during checkpoint I/O/barriers to avoid deep dips.",
-    )
+    p.add_argument("--smooth_power", action="store_true", default=False)
+    p.add_argument("--burn_mem_fraction", type=float, default=0.1)
+    p.add_argument("--burn_intensity_limit", type=float, default=0.75)
+    p.add_argument("--warmup_total_s", type=float, default=30.0)
+    p.add_argument("--cooldown_total_s", type=float, default=30.0)
+    p.add_argument("--enable_ckpt_burn", action="store_true", default=False)
 
     return p.parse_args()
 
@@ -219,230 +189,6 @@ def log_mem(step: int):
     print(f"[MEM] step {step}: alloc={alloc:.2f} GB resv={resv:.2f} GB")
 
 
-class GpuBurner:
-    """
-    Synthetic GPU load generator.
-
-    - Uses a large matmul working set sized by available GPU memory.
-    - Automatically calculates buffer size: 50% of free memory minus 500MB safety margin.
-    - Provides blocking burn_for() for warmup/cooldown.
-    - Provides a background burn thread for overlapping with checkpoint I/O.
-    - Tracks loop counts and durations for all burn operations.
-    """
-
-    def __init__(
-        self,
-        device: torch.device,
-        dtype: torch.dtype = torch.float32,
-    ):
-        self.device = device
-        self.dtype = dtype
-
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-        # Statistics tracking
-        self.warmup_segments: list = []  # [(requested_s, actual_s, loops)]
-        self.checkpoint_burns: list = []  # [(requested_s, actual_s, loops)]
-        self.cooldown_segments: list = []  # [(requested_s, actual_s, loops)]
-
-        self._init_buffers()
-
-    def _init_buffers(self):
-        free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
-
-        # Use 25% of free memory minus 1GB safety margin
-        # Conservative to avoid interfering with training memory usage
-        safety_margin_bytes = 1024 * 1024 * 1024  # 1 GB
-        target_bytes = int(free_bytes * 0.25 - safety_margin_bytes)
-
-        if target_bytes <= 0:
-            # Not enough free memory, use smaller buffer but not minimal
-            # Even small burns need to be somewhat effective
-            target_bytes = int(free_bytes * 0.3)
-            if target_bytes <= 0:
-                n = 512  # Minimum effective size (not 128!)
-                print(
-                    f"[WARN] Very low free memory ({free_bytes / 1024**3:.2f} GB), using reduced burn buffer"
-                )
-            else:
-                bytes_per_elem = torch.finfo(self.dtype).bits // 8
-                n = int((target_bytes / (2 * bytes_per_elem)) ** 0.5)
-                n = max(512, (n // 128) * 128)
-        else:
-            # Approximate: 2 * n^2 * bytes_per_elem live in a matmul
-            bytes_per_elem = torch.finfo(self.dtype).bits // 8
-            n = int((target_bytes / (2 * bytes_per_elem)) ** 0.5)
-
-            # Round to a reasonable multiple to avoid weird tile sizes
-            n = max(512, (n // 128) * 128)
-
-        self.n = n
-        buffer_size_gb = 2 * n * n * torch.finfo(self.dtype).bits // 8 / 1024**3
-
-        try:
-            self.a = torch.randn(n, n, device=self.device, dtype=self.dtype)
-            self.b = torch.randn(n, n, device=self.device, dtype=self.dtype)
-            print(
-                f"[BURN] Allocated {buffer_size_gb:.2f} GB burn buffer (n={n}, free={free_bytes / 1024**3:.2f} GB)"
-            )
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                # Fallback: try progressively smaller buffers
-                torch.cuda.empty_cache()
-                for fallback_n in [2048, 1024, 512]:
-                    try:
-                        self.n = fallback_n
-                        self.a = torch.randn(
-                            fallback_n, fallback_n, device=self.device, dtype=self.dtype
-                        )
-                        self.b = torch.randn(
-                            fallback_n, fallback_n, device=self.device, dtype=self.dtype
-                        )
-                        print(
-                            f"[WARN] OOM during buffer allocation, using fallback buffer (n={fallback_n})"
-                        )
-                        return
-                    except RuntimeError:
-                        continue
-                raise RuntimeError(f"Cannot allocate even minimal burn buffer")
-            else:
-                raise
-
-    # ---------- blocking burn for a fixed duration ----------
-
-    def burn_for(self, duration_s: float, phase: str = "unknown"):
-        """
-        Blocking burn on the default stream for ~duration_s seconds.
-
-        Args:
-            duration_s: Target duration in seconds
-            phase: One of 'warmup', 'checkpoint', 'cooldown' for tracking
-        """
-        if duration_s <= 0:
-            return
-
-        t0 = time.time()
-        loops = 0
-        a, b = self.a, self.b
-        while True:
-            c = a @ b
-            a = c
-            torch.cuda.synchronize(self.device)
-            loops += 1
-            if time.time() - t0 >= duration_s:
-                break
-        self.a = a
-        actual_s = time.time() - t0
-
-        # Record stats
-        if phase == "warmup":
-            self.warmup_segments.append((duration_s, actual_s, loops))
-        elif phase == "checkpoint":
-            self.checkpoint_burns.append((duration_s, actual_s, loops))
-        elif phase == "cooldown":
-            self.cooldown_segments.append((duration_s, actual_s, loops))
-
-    # ---------- background thread burn for checkpoints ----------
-
-    def _burn_loop(self):
-        """Internal loop: keep GPU busy until stop_event is set."""
-        a, b = self.a, self.b
-        loops = 0
-        while not self._stop_event.is_set():
-            c = a @ b
-            a = c
-            # Chunk work so we can stop promptly
-            torch.cuda.synchronize(self.device)
-            loops += 1
-        self.a = a
-        return loops
-
-    def start_burn_thread(self):
-        """Start a background burn thread if not already running."""
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._burn_start_time = time.time()
-        self._thread = threading.Thread(target=self._burn_loop)
-        self._thread.daemon = True
-        self._thread.start()
-
-    def stop_burn_thread(self, join: bool = True):
-        """Signal the background burn thread to stop and optionally join."""
-        if self._thread is None:
-            return
-        self._stop_event.set()
-        if join:
-            actual_s = time.time() - self._burn_start_time
-            self._thread.join()
-            # Background burns don't have a requested duration, just actual
-            self.checkpoint_burns.append((None, actual_s, None))
-        self._thread = None
-
-    def print_summary(self, rank: int = 0):
-        """Print burn statistics summary (rank 0 only)."""
-        if rank != 0:
-            return
-
-        print("\n" + "=" * 60)
-        print("GPU BURNER SUMMARY")
-        print("=" * 60)
-
-        # Warmup
-        if self.warmup_segments:
-            total_req = sum(r for r, _, _ in self.warmup_segments if r is not None)
-            total_act = sum(a for _, a, _ in self.warmup_segments if a is not None)
-            total_loops = sum(l for _, _, l in self.warmup_segments if l is not None)
-            print(f"\nWarmup ({len(self.warmup_segments)} segments):")
-            print(f"  Total requested: {total_req:.2f}s")
-            print(f"  Total actual:    {total_act:.2f}s")
-            print(
-                f"  Overshoot:       {total_act - total_req:.3f}s ({((total_act / total_req - 1) * 100):.2f}%)"
-            )
-            print(f"  Total loops:     {total_loops}")
-
-        # Checkpoints
-        if self.checkpoint_burns:
-            total_act = sum(a for _, a, _ in self.checkpoint_burns if a is not None)
-            total_loops = sum(
-                l for _, _, l in self.checkpoint_burns if l is not None and l > 0
-            )
-            bg_burns = sum(1 for r, _, _ in self.checkpoint_burns if r is None)
-            print(f"\nCheckpoint burns ({len(self.checkpoint_burns)} total):")
-            print(f"  Background burns: {bg_burns}")
-            print(f"  Total duration:   {total_act:.2f}s")
-            if total_loops > 0:
-                print(f"  Total loops:      {total_loops}")
-
-        # Cooldown
-        if self.cooldown_segments:
-            total_req = sum(r for r, _, _ in self.cooldown_segments if r is not None)
-            total_act = sum(a for _, a, _ in self.cooldown_segments if a is not None)
-            total_loops = sum(l for _, _, l in self.cooldown_segments if l is not None)
-            print(f"\nCooldown ({len(self.cooldown_segments)} segments):")
-            print(f"  Total requested: {total_req:.2f}s")
-            print(f"  Total actual:    {total_act:.2f}s")
-            print(
-                f"  Overshoot:       {total_act - total_req:.3f}s ({((total_act / total_req - 1) * 100):.2f}%)"
-            )
-            print(f"  Total loops:     {total_loops}")
-
-        # Grand total
-        all_actual = (
-            sum(a for _, a, _ in self.warmup_segments if a is not None)
-            + sum(a for _, a, _ in self.checkpoint_burns if a is not None)
-            + sum(a for _, a, _ in self.cooldown_segments if a is not None)
-        )
-        all_loops = sum(l for _, _, l in self.warmup_segments if l is not None) + sum(
-            l for _, _, l in self.cooldown_segments if l is not None
-        )
-        print(f"\nGrand Total:")
-        print(f"  Total burn time: {all_actual:.2f}s")
-        print(f"  Total loops:     {all_loops}")
-        print("=" * 60 + "\n")
-
-
 def build_model(cfg: ModelConfig, base: str):
     conf = AutoConfig.from_pretrained(base)
     conf.hidden_size = cfg.hidden_size
@@ -461,12 +207,15 @@ def build_model(cfg: ModelConfig, base: str):
     return AutoModelForCausalLM.from_config(conf)
 
 
+# ———————————————————————————— Dataset ————————————————————————————
+
+
 def build_loader(
     tokenizer,
     seqlen: int,
     bs: int,
     dataset_name: str = "dummy",
-    c4_split: str = "train[:20000]",
+    c4_split: str = "train[:0.01%]",
 ):
     if dataset_name == "dummy":
 
@@ -581,6 +330,86 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
 
 
+class GPUPowerSmoother:
+    def __init__(
+        self, device_id: int, burn_fraction: float = 0.1, limit_factor: float = 0.75
+    ):
+        self.device_id = device_id
+        self.device = torch.device("cuda", device_id)
+        self.limit_factor = limit_factor
+        self.stop_event = threading.Event()
+
+        free_mem, total_mem = torch.cuda.mem_get_info(device_id)
+        burn_bytes = int(free_mem * burn_fraction)
+        element_size = 4
+        N = min(int((burn_bytes / (2 * element_size)) ** 0.5), 4096)
+
+        self.buffer_a = torch.randn(N, N, dtype=torch.float32, device=self.device)
+        self.buffer_b = torch.randn(N, N, dtype=torch.float32, device=self.device)
+
+        self._calibrate()
+
+    def _calibrate(self):
+        warmup_ops = 3
+        for _ in range(warmup_ops):
+            _ = torch.matmul(self.buffer_a, self.buffer_b)
+        torch.cuda.synchronize(self.device_id)
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        num_calibration_ops = 10
+        start.record()
+        for _ in range(num_calibration_ops):
+            _ = torch.matmul(self.buffer_a, self.buffer_b)
+        end.record()
+        torch.cuda.synchronize(self.device_id)
+
+        elapsed_ms = start.elapsed_time(end)
+        self.op_time_s = elapsed_ms / 1000.0 / num_calibration_ops
+
+    def _run_window(self, duty_cycle: float, window_size: float):
+        active_time = window_size * duty_cycle
+        num_ops = max(1, int(active_time / self.op_time_s))
+
+        for _ in range(num_ops):
+            _ = torch.matmul(self.buffer_a, self.buffer_b)
+        torch.cuda.synchronize(self.device_id)
+
+        elapsed = num_ops * self.op_time_s
+        sleep_time = max(0.0, window_size - elapsed)
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+    def ramp(self, duration_s: int, direction: str = "up"):
+        window_size = 0.1
+        num_windows = int(duration_s / window_size)
+
+        for i in range(num_windows):
+            progress = i / max(1, num_windows - 1)
+            if direction == "up":
+                current_duty = progress * self.limit_factor
+            else:
+                current_duty = (1.0 - progress) * self.limit_factor
+
+            self._run_window(current_duty, window_size)
+
+    def _pulsed_burn_loop(self):
+        while not self.stop_event.is_set():
+            self._run_window(self.limit_factor, 0.05)
+
+    @contextmanager
+    def busy_wait(self):
+        self.stop_event.clear()
+        thread = threading.Thread(target=self._pulsed_burn_loop, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            self.stop_event.set()
+            thread.join(timeout=1.0)
+
+
 def main():
     args = parse_args()
 
@@ -641,6 +470,15 @@ def main():
         else:
             model.gradient_checkpointing_enable()
 
+    smoother = None
+    if args.smooth_power:
+        smoother = GPUPowerSmoother(
+            local_rank,
+            burn_fraction=args.burn_mem_fraction,
+            limit_factor=args.burn_intensity_limit,
+        )
+        smoother.ramp(duration_s=int(args.warmup_total_s), direction="up")
+
     # Data
     loader = build_loader(
         tokenizer, args.sequence_length, args.batch_size, args.dataset, args.c4_split
@@ -656,33 +494,6 @@ def main():
 
     scaler = torch.cuda.amp.GradScaler() if effective_precision == "fp16" else None
 
-    burner: Optional[GpuBurner] = None
-    if args.smooth_power:
-        burner = GpuBurner(
-            device=device,
-            dtype=torch.float32,
-        )
-
-    # ---- Startup warmup ramp (pre-training) ----
-    if args.smooth_power and burner is not None and args.warmup_total_s > 0:
-        if rank == 0:
-            print(
-                f"[BURN] Starting warmup ramp ({args.warmup_total_s}s over {args.warmup_segments} segments)"
-            )
-        total = args.warmup_total_s
-        segments = max(1, args.warmup_segments)
-        base_segment = total / segments
-
-        # Cosine ramp from 0 -> 1 for smooth derivative at endpoints
-        for i in range(segments):
-            x = (i + 0.5) / segments  # 0..1
-            intensity = 0.5 * (1.0 - math.cos(math.pi * x))  # 0 → 1
-            duration = base_segment * max(0.0, intensity)
-            if duration > 0:
-                burner.burn_for(duration, phase="warmup")
-        if rank == 0:
-            print(f"[BURN] Warmup complete")
-
     # Training loop
     step = 0
     data_iter = iter(loader)
@@ -695,8 +506,6 @@ def main():
     t0 = time.time()
 
     while step < args.max_steps:
-        iter_t0 = time.time()
-        is_ckpt_step = step > 0 and step % args.save_steps == 0
         try:
             batch = next(data_iter)
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -731,29 +540,17 @@ def main():
                 sched.step()
 
             # Logging
-            iter_t1 = time.time()
-            iter_time = iter_t1 - iter_t0
             if step % args.log_steps == 0 and rank == 0:
                 print(
-                    f"step {step}: "
-                    f"loss={loss.item() * args.gradient_accumulation_steps:.4f} "
-                    f"lr={sched.get_last_lr()[0]:.2e} "
-                    f"step_time={iter_time:.3f}s"
+                    f"step {step}: loss={loss.item() * args.gradient_accumulation_steps:.4f} "
+                    f"lr={sched.get_last_lr()[0]:.2e}"
                 )
                 log_mem(step)
 
             # Checkpointing
-            if is_ckpt_step:
-                ckpt_path = os.path.join(args.output_dir, f"checkpoint_{step}.pt")
-
-                # Start burn on non-rank-0 GPUs IMMEDIATELY before they hit the barrier
-                # This keeps them hot during the entire checkpoint window
-                if args.smooth_power and args.enable_ckpt_burn and burner is not None:
-                    if rank != 0:
-                        burner.start_burn_thread()
-
+            if step > 0 and step % args.save_steps == 0:
                 if rank == 0:
-                    t_ckpt0 = time.time()
+                    ckpt_path = os.path.join(args.output_dir, f"checkpoint_{step}.pt")
                     torch.save(
                         {
                             "step": step,
@@ -765,19 +562,14 @@ def main():
                         },
                         ckpt_path,
                     )
-                    t_ckpt1 = time.time()
-                    ckpt_time = t_ckpt1 - t_ckpt0
-                    print(f"Saved checkpoint: {ckpt_path} (took {ckpt_time:.2f}s)")
+                    print(f"Saved checkpoint: {ckpt_path}")
 
-                # Synchronize all ranks (non-rank-0 burns while waiting)
                 if world_size > 1:
-                    torch.distributed.barrier()
-
-                # Stop burn on non-rank-0 GPUs
-                # Do NOT burn on rank 0 here to avoid power spike
-                if args.smooth_power and args.enable_ckpt_burn and burner is not None:
-                    if rank != 0:
-                        burner.stop_burn_thread(join=True)
+                    if smoother and args.enable_ckpt_burn and rank != 0:
+                        with smoother.busy_wait():
+                            torch.distributed.barrier()
+                    else:
+                        torch.distributed.barrier()
 
             step += 1
 
@@ -792,29 +584,8 @@ def main():
     if rank == 0:
         print(f"Done {step} steps in {time.time() - t0:.1f}s")
 
-    # ---- Cooldown decay ramp (post-training) ----
-    if args.smooth_power and burner is not None and args.cooldown_total_s > 0:
-        if rank == 0:
-            print(
-                f"[BURN] Starting cooldown ramp ({args.cooldown_total_s}s over {args.cooldown_segments} segments)"
-            )
-        total = args.cooldown_total_s
-        segments = max(1, args.cooldown_segments)
-        base_segment = total / segments
-
-        # Cosine from 1 -> 0 for smooth decay
-        for i in range(segments):
-            x = (i + 0.5) / segments  # 0..1
-            intensity = 0.5 * (1.0 + math.cos(math.pi * x))  # 1 → 0
-            duration = base_segment * max(0.0, intensity)
-            if duration > 0:
-                burner.burn_for(duration, phase="cooldown")
-        if rank == 0:
-            print(f"[BURN] Cooldown complete")
-
-    # Print burn summary
-    if args.smooth_power and burner is not None:
-        burner.print_summary(rank)
+    if smoother:
+        smoother.ramp(duration_s=int(args.cooldown_total_s), direction="down")
 
     cleanup_distributed()
 
