@@ -129,6 +129,7 @@ def parse_args():
     p.add_argument("--burn_mem_fraction", type=float, default=0.1)
     p.add_argument("--burn_intensity_limit", type=float, default=0.5)
     p.add_argument("--warmup_total_s", type=float, default=30.0)
+    p.add_argument("--warmup_start_duty", type=float, default=0.0)
     p.add_argument("--cooldown_total_s", type=float, default=30.0)
     p.add_argument("--enable_ckpt_burn", action="store_true", default=False)
 
@@ -381,14 +382,14 @@ class GPUPowerSmoother:
         if sleep_time > 0:
             time.sleep(sleep_time)
 
-    def ramp(self, duration_s: int, direction: str = "up"):
+    def ramp(self, duration_s: int, direction: str = "up", start_duty: float = 0.0):
         window_size = 0.1
         num_windows = int(duration_s / window_size)
 
         for i in range(num_windows):
             progress = i / max(1, num_windows - 1)
             if direction == "up":
-                current_duty = progress * self.limit_factor
+                current_duty = start_duty + progress * (self.limit_factor - start_duty)
             else:
                 current_duty = (1.0 - progress) * self.limit_factor
 
@@ -477,7 +478,11 @@ def main():
             burn_fraction=args.burn_mem_fraction,
             limit_factor=args.burn_intensity_limit,
         )
-        smoother.ramp(duration_s=int(args.warmup_total_s), direction="up")
+        smoother.ramp(
+            duration_s=int(args.warmup_total_s),
+            direction="up",
+            start_duty=args.warmup_start_duty
+        )
 
     # Data
     loader = build_loader(
