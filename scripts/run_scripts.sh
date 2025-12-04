@@ -1,4 +1,4 @@
-python3 profiling/profile.py \
+python3 ../profiling/profile.py \
     --gpu 0 \
     --mode sweep \
     --duty_min 0.1 \
