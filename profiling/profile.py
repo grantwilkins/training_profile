@@ -178,9 +178,10 @@ def init_nvml(gpu_id: int):
     handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
     name = pynvml.nvmlDeviceGetName(handle)
     power_limit = pynvml.nvmlDeviceGetEnforcedPowerLimit(handle) / 1000.0
-    print(
-        f"[NVML] GPU {gpu_id}: {name.decode('utf-8')} (power limit ~{power_limit:.1f} W)"
-    )
+    # Handle both bytes and str return types from pynvml
+    if isinstance(name, bytes):
+        name = name.decode("utf-8")
+    print(f"[NVML] GPU {gpu_id}: {name} (power limit ~{power_limit:.1f} W)")
     return handle
 
 
