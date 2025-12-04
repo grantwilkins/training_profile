@@ -126,8 +126,8 @@ def parse_args():
     )
 
     p.add_argument("--smooth_power", action="store_true", default=False)
-    p.add_argument("--burn_mem_fraction", type=float, default=0.2)
-    p.add_argument("--burn_intensity_limit", type=float, default=0.75)
+    p.add_argument("--burn_mem_fraction", type=float, default=0.1)
+    p.add_argument("--burn_intensity_limit", type=float, default=0.5)
     p.add_argument("--warmup_total_s", type=float, default=30.0)
     p.add_argument("--cooldown_total_s", type=float, default=30.0)
     p.add_argument("--enable_ckpt_burn", action="store_true", default=False)
@@ -373,13 +373,10 @@ class GPUPowerSmoother:
         num_ops = max(1, int(active_time / self.op_time_s))
 
         for _ in range(num_ops):
-            c = torch.matmul(self.buffer_a, self.buffer_b)
-            d = torch.matmul(c, self.buffer_a)
-            e = torch.matmul(d, self.buffer_b)
-            _ = torch.matmul(e, c)
+            _ = torch.matmul(self.buffer_a, self.buffer_b)
         torch.cuda.synchronize(self.device_id)
 
-        elapsed = num_ops * self.op_time_s * 4
+        elapsed = num_ops * self.op_time_s
         sleep_time = max(0.0, window_size - elapsed)
         if sleep_time > 0:
             time.sleep(sleep_time)
@@ -399,10 +396,7 @@ class GPUPowerSmoother:
 
     def _pulsed_burn_loop(self):
         while not self.stop_event.is_set():
-            c = torch.matmul(self.buffer_a, self.buffer_b)
-            d = torch.matmul(c, self.buffer_a)
-            e = torch.matmul(d, self.buffer_b)
-            _ = torch.matmul(e, c)
+            self._run_window(self.limit_factor, 0.05)
 
     @contextmanager
     def busy_wait(self):
