@@ -265,7 +265,7 @@ def build_loader(tokenizer, seqlen: int, bs: int, workers: Optional[int]):
     )
 
 
-# ———————————————————————————— Optimiser ————————————————————————————
+# ———————————————————————————— Optimiz`er ————————————————————————————
 
 
 def make_optim(model, lr, wd, use_fused):

@@ -126,10 +126,7 @@ def parse_args():
     )
 
     p.add_argument("--smooth_power", action="store_true", default=False)
-    p.add_argument("--burn_mem_fraction", type=float, default=0.1)
-    p.add_argument("--burn_intensity_limit", type=float, default=0.5)
     p.add_argument("--warmup_total_s", type=float, default=30.0)
-    p.add_argument("--warmup_start_duty", type=float, default=0.0)
     p.add_argument("--cooldown_total_s", type=float, default=30.0)
     p.add_argument("--enable_ckpt_burn", action="store_true", default=False)
 
@@ -331,78 +328,91 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
 
 
-class GPUPowerSmoother:
-    def __init__(
-        self, device_id: int, burn_fraction: float = 0.1, limit_factor: float = 0.75
-    ):
+class PowerScheduler:
+    P_TRAIN = 185.0
+    P_CKPT = 90.0
+    P_COMP_MAX = 260.0
+    P_WARM_START = 140.0
+    P_COOL_END = 100.0
+
+    CALIB_A = 189.5
+    CALIB_B = 109.4
+
+    N_BURN = 2048
+
+    def __init__(self, device_id: int):
         self.device_id = device_id
         self.device = torch.device("cuda", device_id)
-        self.limit_factor = limit_factor
         self.stop_event = threading.Event()
 
-        free_mem, total_mem = torch.cuda.mem_get_info(device_id)
-        burn_bytes = int(free_mem * burn_fraction)
-        element_size = 4
-        N = min(int((burn_bytes / (2 * element_size)) ** 0.5), 4096)
-
-        self.buffer_a = torch.randn(N, N, dtype=torch.float32, device=self.device)
-        self.buffer_b = torch.randn(N, N, dtype=torch.float32, device=self.device)
+        self.buffer_a = torch.randn(self.N_BURN, self.N_BURN, dtype=torch.float32, device=self.device)
+        self.buffer_b = torch.randn(self.N_BURN, self.N_BURN, dtype=torch.float32, device=self.device)
 
         self._calibrate()
 
     def _calibrate(self):
-        warmup_ops = 3
-        for _ in range(warmup_ops):
+        for _ in range(3):
             _ = torch.matmul(self.buffer_a, self.buffer_b)
         torch.cuda.synchronize(self.device_id)
 
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
-        num_calibration_ops = 10
         start.record()
-        for _ in range(num_calibration_ops):
+        for _ in range(10):
             _ = torch.matmul(self.buffer_a, self.buffer_b)
         end.record()
         torch.cuda.synchronize(self.device_id)
 
-        elapsed_ms = start.elapsed_time(end)
-        self.op_time_s = elapsed_ms / 1000.0 / num_calibration_ops
+        self.op_time_s = start.elapsed_time(end) / 10000.0
 
-    def _run_window(self, duty_cycle: float, window_size: float):
-        active_time = window_size * duty_cycle
-        num_ops = max(1, int(active_time / self.op_time_s))
+    def _power_to_duty(self, power: float) -> float:
+        duty = (power - self.CALIB_B) / self.CALIB_A
+        return max(0.0, min(1.0, duty))
+
+    def _run_window(self, duty: float, window_s: float):
+        active_s = window_s * duty
+        num_ops = max(1, int(active_s / self.op_time_s))
 
         for _ in range(num_ops):
             _ = torch.matmul(self.buffer_a, self.buffer_b)
         torch.cuda.synchronize(self.device_id)
 
-        elapsed = num_ops * self.op_time_s
-        sleep_time = max(0.0, window_size - elapsed)
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+        sleep_s = max(0.0, window_s - num_ops * self.op_time_s)
+        if sleep_s > 0:
+            time.sleep(sleep_s)
 
-    def ramp(self, duration_s: int, direction: str = "up", start_duty: float = 0.0):
-        window_size = 0.1
-        num_windows = int(duration_s / window_size)
+    def warmup(self, duration_s: float):
+        window_s = 0.5
+        num_windows = int(duration_s / window_s)
 
-        for i in range(num_windows):
-            progress = i / max(1, num_windows - 1)
-            if direction == "up":
-                current_duty = start_duty + progress * (self.limit_factor - start_duty)
-            else:
-                current_duty = (1.0 - progress) * self.limit_factor
+        for k in range(num_windows):
+            progress = k / max(1, num_windows - 1)
+            power = self.P_WARM_START + progress * (self.P_TRAIN - self.P_WARM_START)
+            duty = self._power_to_duty(power)
+            self._run_window(duty, window_s)
 
-            self._run_window(current_duty, window_size)
+    def cooldown(self, duration_s: float):
+        window_s = 0.5
+        num_windows = int(duration_s / window_s)
 
-    def _pulsed_burn_loop(self):
+        for k in range(num_windows):
+            progress = k / max(1, num_windows - 1)
+            power = self.P_TRAIN + progress * (self.P_COOL_END - self.P_TRAIN)
+            duty = self._power_to_duty(power)
+            self._run_window(duty, window_s)
+
+    def _compensate_loop(self):
+        p_comp = min(2 * self.P_TRAIN - self.P_CKPT, self.P_COMP_MAX)
+        duty = self._power_to_duty(p_comp)
+
         while not self.stop_event.is_set():
-            self._run_window(self.limit_factor, 0.05)
+            self._run_window(duty, 0.05)
 
     @contextmanager
-    def busy_wait(self):
+    def compensate(self):
         self.stop_event.clear()
-        thread = threading.Thread(target=self._pulsed_burn_loop, daemon=True)
+        thread = threading.Thread(target=self._compensate_loop, daemon=True)
         thread.start()
         try:
             yield
@@ -471,18 +481,10 @@ def main():
         else:
             model.gradient_checkpointing_enable()
 
-    smoother = None
+    scheduler = None
     if args.smooth_power:
-        smoother = GPUPowerSmoother(
-            local_rank,
-            burn_fraction=args.burn_mem_fraction,
-            limit_factor=args.burn_intensity_limit,
-        )
-        smoother.ramp(
-            duration_s=int(args.warmup_total_s),
-            direction="up",
-            start_duty=args.warmup_start_duty,
-        )
+        scheduler = PowerScheduler(local_rank)
+        scheduler.warmup(args.warmup_total_s)
 
     # Data
     loader = build_loader(
@@ -570,8 +572,8 @@ def main():
                     print(f"Saved checkpoint: {ckpt_path}")
 
                 if world_size > 1:
-                    if smoother and args.enable_ckpt_burn and rank != 0:
-                        with smoother.busy_wait():
+                    if scheduler and args.enable_ckpt_burn and rank != 0:
+                        with scheduler.compensate():
                             torch.distributed.barrier()
                     else:
                         torch.distributed.barrier()
@@ -589,8 +591,8 @@ def main():
     if rank == 0:
         print(f"Done {step} steps in {time.time() - t0:.1f}s")
 
-    if smoother:
-        smoother.ramp(duration_s=int(args.cooldown_total_s), direction="down")
+    if scheduler:
+        scheduler.cooldown(args.cooldown_total_s)
 
     cleanup_distributed()
 

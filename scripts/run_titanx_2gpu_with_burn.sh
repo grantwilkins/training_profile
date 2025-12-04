@@ -14,10 +14,8 @@ torchrun --nproc_per_node=2 ../training/train_gpt_simple.py \
   --save_steps 50 \
   --log_steps 10 \
   --dataset wikitext \
-  --smooth_power \
   --enable_ckpt_burn \
-  --warmup_start_duty 0.1 \
-  --burn_intensity_limit 0.5 \
+  --smooth_power
 
 sleep 30 # wait for the training to stop before killing the SMI process
 
