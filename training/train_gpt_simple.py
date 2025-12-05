@@ -364,7 +364,7 @@ class PowerScheduler:
         end.record()
         torch.cuda.synchronize(self.device_id)
 
-        self.op_time_s = start.elapsed_time(end) / 10000.0
+        self.op_time_s = start.elapsed_time(end) / 1000.0 / 10.0
 
     def _power_to_duty(self, power: float) -> float:
         duty = (power - self.CALIB_B) / self.CALIB_A
@@ -481,11 +481,6 @@ def main():
         else:
             model.gradient_checkpointing_enable()
 
-    scheduler = None
-    if args.smooth_power:
-        scheduler = PowerScheduler(local_rank)
-        scheduler.warmup(args.warmup_total_s)
-
     # Data
     loader = build_loader(
         tokenizer, args.sequence_length, args.batch_size, args.dataset, args.c4_split
@@ -508,6 +503,14 @@ def main():
 
     if rank == 0:
         os.makedirs(args.output_dir, exist_ok=True)
+
+    scheduler = None
+    if args.smooth_power:
+        scheduler = PowerScheduler(local_rank)
+        if world_size > 1:
+            torch.distributed.barrier()
+        scheduler.warmup(args.warmup_total_s)
+        torch.cuda.synchronize()
 
     torch.cuda.synchronize()
     t0 = time.time()
@@ -557,7 +560,9 @@ def main():
             # Checkpointing
             if step > 0 and step % args.save_steps == 0:
                 if rank == 0:
+                    print(f"[RANK {rank}] step {step} entering checkpoint block")
                     ckpt_path = os.path.join(args.output_dir, f"checkpoint_{step}.pt")
+                    print(f"[RANK {rank}] step {step} saving checkpoint to {ckpt_path}")
                     torch.save(
                         {
                             "step": step,
@@ -569,13 +574,17 @@ def main():
                         },
                         ckpt_path,
                     )
-                    print(f"Saved checkpoint: {ckpt_path}")
+                    print(f"[RANK {rank}] step {step} checkpoint saved")
 
                 if world_size > 1:
                     if scheduler and args.enable_ckpt_burn and rank != 0:
+                        print(f"[RANK {rank}] step {step} starting ckpt compensation burn")
                         with scheduler.compensate():
                             torch.distributed.barrier()
+                        print(f"[RANK {rank}] step {step} finished ckpt compensation burn")
                     else:
+                        if rank != 0:
+                            print(f"[RANK {rank}] step {step} barrier with NO burn")
                         torch.distributed.barrier()
 
             step += 1
@@ -592,6 +601,8 @@ def main():
         print(f"Done {step} steps in {time.time() - t0:.1f}s")
 
     if scheduler:
+        if world_size > 1:
+            torch.distributed.barrier()
         scheduler.cooldown(args.cooldown_total_s)
 
     cleanup_distributed()

@@ -58,7 +58,8 @@ def parse_power_data(csv_file):
     aggregated["time_seconds"] = (
         aggregated["datetime"] - start_time
     ).dt.total_seconds()
-
+    # rolling average of every 5 samples
+    aggregated["power_watts"] = aggregated["power_watts"].rolling(window=1).mean()
     return aggregated
 
 
@@ -85,7 +86,7 @@ def plot_power_trace(df, output_file=None):
 
 
 def main():
-    csv_file = "../titanx-traces/power-trace_2gpu_2025-12-04-01-22-31.csv"
+    csv_file = "../titanx-traces/power-trace_2gpu_with_burn_2025-12-04-22-47-21.csv"
     output_file = f"../{csv_file.split('/')[-1].split('.')[0]}.pdf"
 
     print(f"Processing power data from: {csv_file}")
