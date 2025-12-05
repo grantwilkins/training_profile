@@ -1,0 +1,5 @@
+burn_type,count,total_loops,avg_loops,std_loops,avg_duration_s,std_duration_s
+warmup,1,1843,1843.0,0.0,30.05241870880127,0.0
+cooldown,1,1266,1266.0,0.0,29.456456422805786,0.0
+checkpoint,0,0,0.0,0.0,0.0,0.0
+total,-,3109,-,-,-,-
