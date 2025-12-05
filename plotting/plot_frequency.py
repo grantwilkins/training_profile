@@ -3,7 +3,9 @@ import numpy as np
 import pandas as pd
 
 csv_file_no_burn = "../titanx-traces/power-trace_2gpu_2025-12-04-01-22-31_processed.csv"
-csv_file_with_burn = "/Users/grantwilkins/training_profile/titanx-traces/power-trace_2gpu_with_burn_2025-12-04-22-47-21_processed.csv"
+csv_file_with_burn = (
+    "../titanx-traces/power-trace_2gpu_with_burn_2025-12-05-01-35-17_processed.csv"
+)
 output_file = "../titanx-traces/frequency_plot.pdf"
 
 
@@ -19,6 +21,12 @@ def compute_fft(csv_file):
 
     power_values = df["power_watts"].values
 
+    # Calculate max ramp rate (per timestep)
+    power_diffs = np.abs(np.diff(power_values))
+    time_diffs_array = time_diffs.values[1:]  # Skip first NaN
+    ramp_rates = power_diffs / time_diffs_array
+    max_ramp_rate = np.max(ramp_rates)
+
     # Compute FFT
     fft_full = np.fft.fft(power_values)
     freqs_full = np.fft.fftfreq(len(power_values), d=1.0 / avg_sample_rate)
@@ -29,12 +37,16 @@ def compute_fft(csv_file):
     total_magnitude = np.sum(positive_fft)
     positive_fft_normalized = positive_fft / total_magnitude
 
-    return positive_freqs, positive_fft_normalized
+    return positive_freqs, positive_fft_normalized, max_ramp_rate
 
 
 # Compute FFT for both traces
-freqs_no_burn, fft_no_burn = compute_fft(csv_file_no_burn)
-freqs_with_burn, fft_with_burn = compute_fft(csv_file_with_burn)
+freqs_no_burn, fft_no_burn, max_ramp_no_burn = compute_fft(csv_file_no_burn)
+freqs_with_burn, fft_with_burn, max_ramp_with_burn = compute_fft(csv_file_with_burn)
+
+# Print max ramp rates
+print(f"Max ramp rate (without burn): {max_ramp_no_burn:.2f} W/s")
+print(f"Max ramp rate (with burn): {max_ramp_with_burn:.2f} W/s")
 
 # Plot both FFTs on the same plot
 plt.figure(figsize=(7, 5))
