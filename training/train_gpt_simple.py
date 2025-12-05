@@ -756,7 +756,7 @@ def main():
             burn_stats_filename = (
                 f"burn_stats_{args.model_size}_{world_size}gpu_{timestamp}.csv"
             )
-            burn_stats_path = os.path.join(args.output_dir, burn_stats_filename)
+            burn_stats_path = os.path.join("./", burn_stats_filename)
             scheduler.save_burn_stats(burn_stats_path)
             print(f"Burn statistics saved to {burn_stats_path}")
 
