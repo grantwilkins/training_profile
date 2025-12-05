@@ -38,7 +38,7 @@ def parse_power_data(csv_file):
     )
 
     df["datetime"] = (
-        pd.to_datetime(df["timestamp"], format="%Y/%m/%d %H:%M:%S.%f")
+        pd.to_datetime(df["timestamp"], format="mixed")
         if "timestamp" in df.columns
         else pd.to_datetime(df["datetime"])
     )
@@ -86,7 +86,7 @@ def plot_power_trace(df, output_file=None):
 
 
 def main():
-    csv_file = "../titanx-traces/power-trace_2gpu_with_burn_2025-12-05-02-26-28.csv"
+    csv_file = "../titanx-traces/power-trace_2gpu_with_burn_2025-12-05-18-58-24.csv"
     output_file = f"../{csv_file.split('/')[-1].split('.')[0]}.pdf"
 
     print(f"Processing power data from: {csv_file}")

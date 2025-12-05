@@ -349,8 +349,18 @@ def setup_distributed(backend: str = "nccl"):
         return 0, 0, 1, None
 
 
-def cleanup_distributed():
+def cleanup_distributed(gloo_group=None):
+    """Clean up distributed process groups in proper order.
+
+    CRITICAL: Destroy secondary groups before the default group to avoid
+    c10::error and multiprocessing crashes at shutdown.
+    """
     if torch.distributed.is_initialized():
+        # 1. Explicitly destroy Gloo group first (if it exists)
+        if gloo_group is not None:
+            torch.distributed.destroy_process_group(gloo_group)
+
+        # 2. Destroy the default (NCCL) group last
         torch.distributed.destroy_process_group()
 
 
@@ -589,7 +599,7 @@ def main():
         if not fit["feasible"]:
             print("[ERROR] Model doesn't fit in GPU memory")
             print("Try: --model_size 125M --batch_size 1 --sequence_length 256")
-            cleanup_distributed()
+            cleanup_distributed(gloo_group)
             return
 
     dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[
@@ -761,7 +771,13 @@ def main():
                             total_loops += loops
                             burn_iterations += 1
 
-                        barrier_thread.join(timeout=5.0)
+                        # CRITICAL: Ensure barrier thread completes before proceeding
+                        barrier_thread.join(timeout=10.0)
+                        if barrier_thread.is_alive():
+                            print(
+                                f"[RANK {rank}] WARNING: Barrier thread still alive after timeout!"
+                            )
+
                         duration = time.time() - t_start
                         scheduler.record_checkpoint_burn(total_loops, duration)
 
@@ -812,7 +828,17 @@ def main():
             scheduler.save_burn_stats(burn_stats_path)
             print(f"Burn statistics saved to {burn_stats_path}")
 
-    cleanup_distributed()
+    if world_size > 1:
+        torch.cuda.synchronize()  # Ensure all CUDA ops are done
+        if gloo_group is not None:
+            torch.distributed.barrier(group=gloo_group)
+        else:
+            torch.distributed.barrier()
+
+        if rank == 0:
+            print("[CLEANUP] All ranks synchronized, destroying process groups")
+
+    cleanup_distributed(gloo_group)
 
 
 if __name__ == "__main__":
