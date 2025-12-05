@@ -86,7 +86,7 @@ def plot_power_trace(df, output_file=None):
 
 
 def main():
-    csv_file = "../titanx-traces/power-trace_2gpu_2025-12-05-01-42-25.csv"
+    csv_file = "../titanx-traces/power-trace_2gpu_with_burn_2025-12-05-02-04-19.csv"
     output_file = f"../{csv_file.split('/')[-1].split('.')[0]}.pdf"
 
     print(f"Processing power data from: {csv_file}")

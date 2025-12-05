@@ -130,6 +130,12 @@ def parse_args():
     p.add_argument("--warmup_total_s", type=float, default=30.0)
     p.add_argument("--cooldown_total_s", type=float, default=30.0)
     p.add_argument("--enable_ckpt_burn", action="store_true", default=False)
+    p.add_argument(
+        "--ddp_backend",
+        choices=["nccl", "gloo"],
+        default="nccl",
+        help="Process group backend for DDP (use gloo for CPU-only barriers)",
+    )
 
     return p.parse_args()
 
@@ -301,7 +307,7 @@ def build_loader(
 # ———————————————————————————— Training ————————————————————————————
 
 
-def setup_distributed():
+def setup_distributed(backend: str = "nccl"):
     """Setup DDP if launched with torchrun, else single GPU."""
     if "RANK" in os.environ:
         # torchrun sets these
@@ -310,7 +316,7 @@ def setup_distributed():
         world_size = int(os.environ["WORLD_SIZE"])
 
         torch.cuda.set_device(local_rank)
-        torch.distributed.init_process_group(backend="nccl")
+        torch.distributed.init_process_group(backend=backend)
 
         return rank, local_rank, world_size
     else:
@@ -520,11 +526,11 @@ class PowerScheduler:
 def main():
     args = parse_args()
 
-    rank, local_rank, world_size = setup_distributed()
+    rank, local_rank, world_size = setup_distributed(args.ddp_backend)
     device = torch.device("cuda", local_rank)
 
     if rank == 0:
-        print(f"Training on {world_size} GPU(s)")
+        print(f"Training on {world_size} GPU(s) with {args.ddp_backend} backend")
 
     set_seed(42)
 
@@ -678,12 +684,9 @@ def main():
                             f"[RANK {rank}] step {step} starting ckpt compensation burn"
                         )
 
-                        # Run barrier in helper thread, burn on main thread
-                        def _wait_barrier():
-                            torch.distributed.barrier()
-
-                        barrier_thread = threading.Thread(target=_wait_barrier)
-                        barrier_thread.start()
+                        # Ensure CUDA context is set correctly
+                        torch.cuda.set_device(local_rank)
+                        torch.cuda.synchronize(local_rank)
 
                         # Compute compensation power and duty
                         p_comp = min(
@@ -691,20 +694,38 @@ def main():
                             scheduler.P_COMP_MAX,
                         )
                         duty = scheduler._power_to_duty(p_comp)
+                        print(
+                            f"[RANK {rank}] target power={p_comp:.1f}W duty={duty:.3f}"
+                        )
+
+                        # Run barrier in helper thread, burn on main thread
+                        barrier_done = threading.Event()
+
+                        def _wait_barrier():
+                            torch.distributed.barrier()
+                            barrier_done.set()
+
+                        barrier_thread = threading.Thread(
+                            target=_wait_barrier, daemon=False
+                        )
+                        barrier_thread.start()
 
                         # Burn on main thread while waiting for barrier
                         t_start = time.time()
                         total_loops = 0
-                        while barrier_thread.is_alive():
+                        burn_iterations = 0
+                        while not barrier_done.is_set():
                             loops = scheduler._run_window(duty, 0.05)
                             total_loops += loops
+                            burn_iterations += 1
 
-                        barrier_thread.join()
+                        barrier_thread.join(timeout=5.0)
                         duration = time.time() - t_start
                         scheduler.record_checkpoint_burn(total_loops, duration)
 
                         print(
-                            f"[RANK {rank}] step {step} finished ckpt compensation burn"
+                            f"[RANK {rank}] step {step} finished ckpt compensation burn: "
+                            f"{total_loops} loops in {duration:.2f}s ({burn_iterations} iterations)"
                         )
                     else:
                         if rank != 0:
