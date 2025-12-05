@@ -59,7 +59,7 @@ def parse_power_data(csv_file):
         aggregated["datetime"] - start_time
     ).dt.total_seconds()
     # rolling average of every 5 samples
-    aggregated["power_watts"] = aggregated["power_watts"].rolling(window=1).mean()
+    aggregated["power_watts"] = aggregated["power_watts"].rolling(window=2).mean()
     return aggregated
 
 

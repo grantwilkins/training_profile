@@ -3,6 +3,11 @@
 train_gpt_simple.py – Single-node multi-GPU training (no Ray)
 ==============================================================
 
+MODIFIED: Dual process group approach
+- Primary NCCL group for fast training communication
+- Secondary Gloo group for CPU-based barriers during checkpointing
+  (allows CUDA burn operations to run concurrently)
+
 For single-node training with 1-2 GPUs on a Titan X box.
 Uses native PyTorch DDP via torchrun.
 
@@ -134,7 +139,7 @@ def parse_args():
         "--ddp_backend",
         choices=["nccl", "gloo"],
         default="nccl",
-        help="Process group backend for DDP (use gloo for CPU-only barriers)",
+        help="Process group backend for DDP (nccl recommended for multi-GPU)",
     )
 
     return p.parse_args()
@@ -308,7 +313,13 @@ def build_loader(
 
 
 def setup_distributed(backend: str = "nccl"):
-    """Setup DDP if launched with torchrun, else single GPU."""
+    """Setup DDP if launched with torchrun, else single GPU.
+
+    KEY MODIFICATION: Creates two process groups when using NCCL:
+    - Primary NCCL group for training (fast GPU communication)
+    - Secondary Gloo group for CPU-based barriers during checkpointing
+      (allows CUDA burn operations to run concurrently)
+    """
     if "RANK" in os.environ:
         # torchrun sets these
         rank = int(os.environ["RANK"])
@@ -316,12 +327,26 @@ def setup_distributed(backend: str = "nccl"):
         world_size = int(os.environ["WORLD_SIZE"])
 
         torch.cuda.set_device(local_rank)
+
+        # Primary group for training (NCCL or Gloo)
         torch.distributed.init_process_group(backend=backend)
 
-        return rank, local_rank, world_size
+        # Secondary Gloo group for CPU-based synchronization
+        # This allows CUDA operations to continue during barriers
+        gloo_group = None
+        if backend == "nccl" and world_size > 1:
+            if rank == 0:
+                print(
+                    "[SETUP] Creating secondary Gloo process group for checkpoint sync"
+                )
+            gloo_group = torch.distributed.new_group(
+                ranks=list(range(world_size)), backend="gloo"
+            )
+
+        return rank, local_rank, world_size, gloo_group
     else:
         # Single GPU
-        return 0, 0, 1
+        return 0, 0, 1, None
 
 
 def cleanup_distributed():
@@ -526,11 +551,15 @@ class PowerScheduler:
 def main():
     args = parse_args()
 
-    rank, local_rank, world_size = setup_distributed(args.ddp_backend)
+    # MODIFIED: Now returns gloo_group as well
+    rank, local_rank, world_size, gloo_group = setup_distributed(args.ddp_backend)
     device = torch.device("cuda", local_rank)
 
     if rank == 0:
-        print(f"Training on {world_size} GPU(s) with {args.ddp_backend} backend")
+        backend_info = args.ddp_backend
+        if gloo_group is not None:
+            backend_info += " (with Gloo sync group)"
+        print(f"Training on {world_size} GPU(s) with {backend_info}")
 
     set_seed(42)
 
@@ -610,7 +639,11 @@ def main():
     if args.smooth_power:
         scheduler = PowerScheduler(local_rank)
         if world_size > 1:
-            torch.distributed.barrier()
+            # Use Gloo barrier for warmup if available, otherwise default
+            if gloo_group is not None:
+                torch.distributed.barrier(group=gloo_group)
+            else:
+                torch.distributed.barrier()
         scheduler.warmup(args.warmup_total_s)
         torch.cuda.synchronize()
 
@@ -679,9 +712,11 @@ def main():
                     print(f"[RANK {rank}] step {step} checkpoint saved")
 
                 if world_size > 1:
+                    # KEY MODIFICATION: Use Gloo group for barrier during checkpoint
+                    # This allows CUDA operations (burn) to proceed concurrently
                     if scheduler and args.enable_ckpt_burn and rank != 0:
                         print(
-                            f"[RANK {rank}] step {step} starting ckpt compensation burn"
+                            f"[RANK {rank}] step {step} starting ckpt compensation burn (NCCL+Gloo mode)"
                         )
 
                         # Ensure CUDA context is set correctly
@@ -698,11 +733,17 @@ def main():
                             f"[RANK {rank}] target power={p_comp:.1f}W duty={duty:.3f}"
                         )
 
-                        # Run barrier in helper thread, burn on main thread
+                        # Run Gloo barrier in helper thread, burn on main thread
                         barrier_done = threading.Event()
 
                         def _wait_barrier():
-                            torch.distributed.barrier()
+                            # Use Gloo group for CPU-based barrier
+                            # This doesn't block CUDA operations!
+                            if gloo_group is not None:
+                                torch.distributed.barrier(group=gloo_group)
+                            else:
+                                # Fallback to default barrier (will block CUDA with NCCL)
+                                torch.distributed.barrier()
                             barrier_done.set()
 
                         barrier_thread = threading.Thread(
@@ -711,6 +752,7 @@ def main():
                         barrier_thread.start()
 
                         # Burn on main thread while waiting for barrier
+                        # This works because Gloo barrier runs on CPU!
                         t_start = time.time()
                         total_loops = 0
                         burn_iterations = 0
@@ -728,9 +770,15 @@ def main():
                             f"{total_loops} loops in {duration:.2f}s ({burn_iterations} iterations)"
                         )
                     else:
+                        # Rank 0 or burn disabled: just wait for barrier
                         if rank != 0:
                             print(f"[RANK {rank}] step {step} barrier with NO burn")
-                        torch.distributed.barrier()
+
+                        # Use Gloo barrier if available, otherwise default
+                        if gloo_group is not None:
+                            torch.distributed.barrier(group=gloo_group)
+                        else:
+                            torch.distributed.barrier()
 
             step += 1
 
@@ -747,7 +795,11 @@ def main():
 
     if scheduler:
         if world_size > 1:
-            torch.distributed.barrier()
+            # Use Gloo barrier for cooldown if available
+            if gloo_group is not None:
+                torch.distributed.barrier(group=gloo_group)
+            else:
+                torch.distributed.barrier()
         scheduler.cooldown(args.cooldown_total_s)
 
         # Save burn statistics

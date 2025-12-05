@@ -2,9 +2,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-csv_file_no_burn = "../titanx-traces/power-trace_2gpu_2025-12-05-01-42-25_processed.csv"
+csv_file_no_burn = "../titanx-traces/power-trace_2gpu_2025-12-05-02-37-06_processed.csv"
 csv_file_with_burn = (
-    "../titanx-traces/power-trace_2gpu_with_burn_2025-12-05-01-35-17_processed.csv"
+    "../titanx-traces/power-trace_2gpu_with_burn_2025-12-05-02-26-28_processed.csv"
 )
 output_file = "../titanx-traces/frequency_plot.pdf"
 
