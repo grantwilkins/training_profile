@@ -383,7 +383,7 @@ class PowerScheduler:
             time.sleep(sleep_s)
 
     def warmup(self, duration_s: float):
-        window_s = 0.5
+        window_s = 0.05
         num_windows = int(duration_s / window_s)
 
         for k in range(num_windows):
@@ -393,7 +393,7 @@ class PowerScheduler:
             self._run_window(duty, window_s)
 
     def cooldown(self, duration_s: float):
-        window_s = 0.5
+        window_s = 0.05
         num_windows = int(duration_s / window_s)
 
         for k in range(num_windows):
