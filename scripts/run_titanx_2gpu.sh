@@ -10,11 +10,11 @@ torchrun --nproc_per_node=2 ../training/train_gpt_simple.py \
   --sequence_length 256 \
   --gradient_accumulation_steps 10 \
   --precision fp32 \
-  --max_steps 500 \
+  --max_steps 250 \
   --save_steps 50 \
   --log_steps 10 \
   --dataset wikitext \
-  --ddp_backend gloo
+  --ddp_backend nccl
 
 sleep 30
 
