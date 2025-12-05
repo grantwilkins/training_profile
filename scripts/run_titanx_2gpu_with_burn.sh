@@ -5,7 +5,7 @@ LOG=../titanx-traces/power-trace_2gpu_with_burn_${DATE_TIME}.csv
 nvidia-smi --query-gpu=timestamp,power.draw,utilization.gpu,memory.used --format=csv -lms 100 >> "$LOG" &
 SMI_PID=$!
 torchrun --nproc_per_node=2 ../training/train_gpt_simple.py \
-  --model_size 125M \
+  --model_size 350M \
   --batch_size 1 \
   --sequence_length 256 \
   --gradient_accumulation_steps 10 \
@@ -16,7 +16,7 @@ torchrun --nproc_per_node=2 ../training/train_gpt_simple.py \
   --dataset wikitext \
   --enable_ckpt_burn \
   --smooth_power \
-  --ddp_backend gloo
+  --ddp_backend nccl
 
 sleep 30 # wait for the training to stop before killing the SMI process
 
