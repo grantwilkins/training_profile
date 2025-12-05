@@ -14,6 +14,7 @@ Usage (2 GPUs):
 """
 
 import argparse
+import csv
 import json
 import os
 
@@ -23,7 +24,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -343,10 +344,21 @@ class PowerScheduler:
     def __init__(self, device_id: int):
         self.device_id = device_id
         self.device = torch.device("cuda", device_id)
-        self.stop_event = threading.Event()
 
-        self.buffer_a = torch.randn(self.N_BURN, self.N_BURN, dtype=torch.float32, device=self.device)
-        self.buffer_b = torch.randn(self.N_BURN, self.N_BURN, dtype=torch.float32, device=self.device)
+        self.buffer_a = torch.randn(
+            self.N_BURN, self.N_BURN, dtype=torch.float32, device=self.device
+        )
+        self.buffer_b = torch.randn(
+            self.N_BURN, self.N_BURN, dtype=torch.float32, device=self.device
+        )
+
+        # Burn loop tracking
+        self.warmup_loops: List[int] = []
+        self.cooldown_loops: List[int] = []
+        self.checkpoint_loops: List[int] = []
+        self.warmup_durations: List[float] = []
+        self.cooldown_durations: List[float] = []
+        self.checkpoint_durations: List[float] = []
 
         self._calibrate()
 
@@ -370,7 +382,7 @@ class PowerScheduler:
         duty = (power - self.CALIB_B) / self.CALIB_A
         return max(0.0, min(1.0, duty))
 
-    def _run_window(self, duty: float, window_s: float):
+    def _run_window(self, duty: float, window_s: float) -> int:
         active_s = window_s * duty
         num_ops = max(1, int(active_s / self.op_time_s))
 
@@ -382,43 +394,128 @@ class PowerScheduler:
         if sleep_s > 0:
             time.sleep(sleep_s)
 
+        return num_ops
+
     def warmup(self, duration_s: float):
         window_s = 0.05
         num_windows = int(duration_s / window_s)
 
+        t_start = time.time()
+        total_loops = 0
         for k in range(num_windows):
             progress = k / max(1, num_windows - 1)
             power = self.P_WARM_START + progress * (self.P_TRAIN - self.P_WARM_START)
             duty = self._power_to_duty(power)
-            self._run_window(duty, window_s)
+            loops = self._run_window(duty, window_s)
+            total_loops += loops
+
+        duration = time.time() - t_start
+        self.warmup_loops.append(total_loops)
+        self.warmup_durations.append(duration)
 
     def cooldown(self, duration_s: float):
         window_s = 0.05
         num_windows = int(duration_s / window_s)
 
+        t_start = time.time()
+        total_loops = 0
         for k in range(num_windows):
             progress = k / max(1, num_windows - 1)
             power = self.P_TRAIN + progress * (self.P_COOL_END - self.P_TRAIN)
             duty = self._power_to_duty(power)
-            self._run_window(duty, window_s)
+            loops = self._run_window(duty, window_s)
+            total_loops += loops
 
-    def _compensate_loop(self):
-        p_comp = min(2 * self.P_TRAIN - self.P_CKPT, self.P_COMP_MAX)
-        duty = self._power_to_duty(p_comp)
+        duration = time.time() - t_start
+        self.cooldown_loops.append(total_loops)
+        self.cooldown_durations.append(duration)
 
-        while not self.stop_event.is_set():
-            self._run_window(duty, 0.05)
+    def record_checkpoint_burn(self, total_loops: int, duration: float):
+        """Record statistics from a checkpoint burn event."""
+        self.checkpoint_loops.append(total_loops)
+        self.checkpoint_durations.append(duration)
 
-    @contextmanager
-    def compensate(self):
-        self.stop_event.clear()
-        thread = threading.Thread(target=self._compensate_loop, daemon=True)
-        thread.start()
-        try:
-            yield
-        finally:
-            self.stop_event.set()
-            thread.join(timeout=1.0)
+
+    def save_burn_stats(self, filepath: str):
+        import numpy as np
+
+        def calc_stats(data: List[int]) -> tuple:
+            if not data:
+                return 0, 0.0, 0.0
+            arr = np.array(data)
+            return len(data), float(np.mean(arr)), float(np.std(arr))
+
+        def calc_stats_float(data: List[float]) -> tuple:
+            if not data:
+                return 0, 0.0, 0.0
+            arr = np.array(data)
+            return len(data), float(np.mean(arr)), float(np.std(arr))
+
+        warmup_count, warmup_loops_avg, warmup_loops_std = calc_stats(self.warmup_loops)
+        _, warmup_dur_avg, warmup_dur_std = calc_stats_float(self.warmup_durations)
+
+        cooldown_count, cooldown_loops_avg, cooldown_loops_std = calc_stats(
+            self.cooldown_loops
+        )
+        _, cooldown_dur_avg, cooldown_dur_std = calc_stats_float(
+            self.cooldown_durations
+        )
+
+        ckpt_count, ckpt_loops_avg, ckpt_loops_std = calc_stats(self.checkpoint_loops)
+        _, ckpt_dur_avg, ckpt_dur_std = calc_stats_float(self.checkpoint_durations)
+
+        total_warmup_loops = sum(self.warmup_loops)
+        total_cooldown_loops = sum(self.cooldown_loops)
+        total_ckpt_loops = sum(self.checkpoint_loops)
+        total_loops = total_warmup_loops + total_cooldown_loops + total_ckpt_loops
+
+        with open(filepath, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "burn_type",
+                    "count",
+                    "total_loops",
+                    "avg_loops",
+                    "std_loops",
+                    "avg_duration_s",
+                    "std_duration_s",
+                ]
+            )
+            writer.writerow(
+                [
+                    "warmup",
+                    warmup_count,
+                    total_warmup_loops,
+                    warmup_loops_avg,
+                    warmup_loops_std,
+                    warmup_dur_avg,
+                    warmup_dur_std,
+                ]
+            )
+            writer.writerow(
+                [
+                    "cooldown",
+                    cooldown_count,
+                    total_cooldown_loops,
+                    cooldown_loops_avg,
+                    cooldown_loops_std,
+                    cooldown_dur_avg,
+                    cooldown_dur_std,
+                ]
+            )
+            writer.writerow(
+                [
+                    "checkpoint",
+                    ckpt_count,
+                    total_ckpt_loops,
+                    ckpt_loops_avg,
+                    ckpt_loops_std,
+                    ckpt_dur_avg,
+                    ckpt_dur_std,
+                ]
+            )
+            writer.writerow(["total", "-", total_loops, "-", "-", "-", "-"])
 
 
 def main():
@@ -578,10 +675,38 @@ def main():
 
                 if world_size > 1:
                     if scheduler and args.enable_ckpt_burn and rank != 0:
-                        print(f"[RANK {rank}] step {step} starting ckpt compensation burn")
-                        with scheduler.compensate():
+                        print(
+                            f"[RANK {rank}] step {step} starting ckpt compensation burn"
+                        )
+
+                        # Run barrier in helper thread, burn on main thread
+                        def _wait_barrier():
                             torch.distributed.barrier()
-                        print(f"[RANK {rank}] step {step} finished ckpt compensation burn")
+
+                        barrier_thread = threading.Thread(target=_wait_barrier)
+                        barrier_thread.start()
+
+                        # Compute compensation power and duty
+                        p_comp = min(
+                            2 * scheduler.P_TRAIN - scheduler.P_CKPT,
+                            scheduler.P_COMP_MAX,
+                        )
+                        duty = scheduler._power_to_duty(p_comp)
+
+                        # Burn on main thread while waiting for barrier
+                        t_start = time.time()
+                        total_loops = 0
+                        while barrier_thread.is_alive():
+                            loops = scheduler._run_window(duty, 0.05)
+                            total_loops += loops
+
+                        barrier_thread.join()
+                        duration = time.time() - t_start
+                        scheduler.record_checkpoint_burn(total_loops, duration)
+
+                        print(
+                            f"[RANK {rank}] step {step} finished ckpt compensation burn"
+                        )
                     else:
                         if rank != 0:
                             print(f"[RANK {rank}] step {step} barrier with NO burn")
@@ -604,6 +729,16 @@ def main():
         if world_size > 1:
             torch.distributed.barrier()
         scheduler.cooldown(args.cooldown_total_s)
+
+        # Save burn statistics
+        if rank == 0:
+            timestamp = time.strftime("%Y-%m-%d-%H-%M-%S")
+            burn_stats_filename = (
+                f"burn_stats_{args.model_size}_{world_size}gpu_{timestamp}.csv"
+            )
+            burn_stats_path = os.path.join(args.output_dir, burn_stats_filename)
+            scheduler.save_burn_stats(burn_stats_path)
+            print(f"Burn statistics saved to {burn_stats_path}")
 
     cleanup_distributed()
 

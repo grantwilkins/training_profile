@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-csv_file_no_burn = "../titanx-traces/power-trace_2gpu_2025-12-04-01-22-31_processed.csv"
+csv_file_no_burn = "../titanx-traces/power-trace_2gpu_2025-12-05-01-42-25_processed.csv"
 csv_file_with_burn = (
     "../titanx-traces/power-trace_2gpu_with_burn_2025-12-05-01-35-17_processed.csv"
 )
@@ -21,15 +21,25 @@ def compute_fft(csv_file):
 
     power_values = df["power_watts"].values
 
-    # Calculate max ramp rate (per timestep)
-    power_diffs = np.abs(np.diff(power_values))
+    # Apply rolling window mean of 5 values
+    power_values_smoothed = (
+        pd.Series(power_values).rolling(window=5, center=True).mean().values
+    )
+    # Remove NaN values from smoothing
+    power_values_smoothed = power_values_smoothed[~np.isnan(power_values_smoothed)]
+
+    # Calculate max ramp rate (per timestep) on smoothed data
+    power_diffs = np.abs(np.diff(power_values_smoothed))
+    # Adjust time_diffs to match smoothed data length
     time_diffs_array = time_diffs.values[1:]  # Skip first NaN
+    # Trim to match smoothed data length
+    time_diffs_array = time_diffs_array[: len(power_diffs)]
     ramp_rates = power_diffs / time_diffs_array
     max_ramp_rate = np.max(ramp_rates)
 
-    # Compute FFT
-    fft_full = np.fft.fft(power_values)
-    freqs_full = np.fft.fftfreq(len(power_values), d=1.0 / avg_sample_rate)
+    # Compute FFT on smoothed data
+    fft_full = np.fft.fft(power_values_smoothed)
+    freqs_full = np.fft.fftfreq(len(power_values_smoothed), d=1.0 / avg_sample_rate)
     positive_freqs = freqs_full[: len(freqs_full) // 2]
     positive_fft = np.abs(fft_full[: len(fft_full) // 2])
 
