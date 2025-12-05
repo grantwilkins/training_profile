@@ -15,6 +15,6 @@ torchrun --nproc_per_node=2 ../training/train_gpt_simple.py \
   --log_steps 10 \
   --dataset wikitext
 
-sleep 60
+sleep 30
 
 kill -9 "$SMI_PID"
