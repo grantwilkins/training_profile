@@ -13,7 +13,8 @@ torchrun --nproc_per_node=2 ../training/train_gpt_simple.py \
   --max_steps 500 \
   --save_steps 50 \
   --log_steps 10 \
-  --dataset wikitext
+  --dataset wikitext \
+  --ddp_backend gloo
 
 sleep 30
 
