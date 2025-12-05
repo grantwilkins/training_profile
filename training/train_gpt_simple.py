@@ -435,7 +435,6 @@ class PowerScheduler:
         self.checkpoint_loops.append(total_loops)
         self.checkpoint_durations.append(duration)
 
-
     def save_burn_stats(self, filepath: str):
         import numpy as np
 
